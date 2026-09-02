@@ -1,0 +1,247 @@
+name: Build Ginkgo Kernel (UART console enabled)
+
+# Manuel olarak Actions sekmesinden calistirilir.
+# Repo: Genom-Project/android_kernel_xiaomi_ginkgo (sdm-10 branch) kullanilir.
+# Bu kaynak, CONFIG_SERIAL_MSM_GENI_CONSOLE kapali geldigi icin
+# UART'ta kernel loglari hic gorunmuyordu. Bu workflow o ayari
+# otomatik acar, ayrica pstore/ramoops debug ayarlarini da acik tutar.
+#
+# Kullanim:
+# 1) Kendi GitHub hesabinda bos bir repo ac (ornek: ginkgo-kernel-build)
+# 2) Bu dosyayi o reponun .github/workflows/build-ginkgo-kernel.yml
+#    yoluna ekle (repo bos olsa da olur, workflow kendi kaynagini
+#    ayrica clone'luyor)
+# 3) Actions sekmesinden "Build Ginkgo Kernel" workflow'unu sec,
+#    "Run workflow" ile baslat
+# 4) Build bitince Artifacts kismindan flashable zip'i indir
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel kaynak reposu (owner/repo)'
+        required: false
+        default: 'Genom-Project/android_kernel_xiaomi_ginkgo'
+      kernel_branch:
+        description: 'Kernel branch'
+        required: false
+        default: 'sdm-10'
+      defconfig:
+        description: 'Defconfig adi (vendor/ altindaki dosya adi, uzantisiz)'
+        required: false
+        default: 'ginkgo-stock_defconfig'
+      apply_uart_fix:
+        description: 'CONFIG_SERIAL_MSM_GENI_CONSOLE fixini otomatik uygula'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Disk alanini genislet
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          swap-size-mb: 4096
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Bagimliliklari kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            python3 python-is-python3 git curl zip unzip \
+            device-tree-compiler cpio kmod rsync \
+            libncurses-dev pahole zstd
+
+      - name: Kernel kaynagini clone'la
+        run: |
+          git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" \
+            "https://github.com/${{ github.event.inputs.kernel_repo }}.git" kernel_src
+
+      - name: AOSP Clang prebuilt indir (clang-r365631c)
+        run: |
+          mkdir -p toolchain/clang
+          curl -L --retry 5 --retry-delay 5 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r365631c.tar.gz" \
+            -o clang.tar.gz
+          tar -xzf clang.tar.gz -C toolchain/clang
+          echo "$PWD/toolchain/clang/bin" >> "$GITHUB_PATH"
+
+      - name: GCC (aarch64) prebuilt indir (AOSP legacy binutils icin)
+        run: |
+          mkdir -p toolchain/gcc-aarch64
+          curl -L --retry 5 --retry-delay 5 \
+            "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/heads/master.tar.gz" \
+            -o gcc-aarch64.tar.gz
+          tar -xzf gcc-aarch64.tar.gz -C toolchain/gcc-aarch64
+          echo "$PWD/toolchain/gcc-aarch64/bin" >> "$GITHUB_PATH"
+
+      - name: UART console fix uygula (CONFIG_SERIAL_MSM_GENI_CONSOLE)
+        if: ${{ github.event.inputs.apply_uart_fix == 'true' }}
+        run: |
+          cd kernel_src
+          DEFCONFIG="arch/arm64/configs/vendor/${{ github.event.inputs.defconfig }}"
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "HATA: $DEFCONFIG bulunamadi, defconfig adini kontrol et."
+            find arch/arm64/configs -iname "*ginkgo*"
+            exit 1
+          fi
+
+          # Ana kernel console driver'ini ac
+          if grep -q "^# CONFIG_SERIAL_MSM_GENI_CONSOLE is not set" "$DEFCONFIG"; then
+            sed -i 's/^# CONFIG_SERIAL_MSM_GENI_CONSOLE is not set/CONFIG_SERIAL_MSM_GENI_CONSOLE=y/' "$DEFCONFIG"
+            echo "OK: CONFIG_SERIAL_MSM_GENI_CONSOLE acildi"
+          elif grep -q "^CONFIG_SERIAL_MSM_GENI_CONSOLE=y" "$DEFCONFIG"; then
+            echo "Zaten acikti: CONFIG_SERIAL_MSM_GENI_CONSOLE=y"
+          else
+            echo "CONFIG_SERIAL_MSM_GENI_CONSOLE=y" >> "$DEFCONFIG"
+            echo "OK: CONFIG_SERIAL_MSM_GENI_CONSOLE satiri eklendi"
+          fi
+
+          # Panic/crash sonrasi da log alabilmek icin pstore/ramoops ayarlarini
+          # garanti altina al (cogu defconfig'te zaten acik gelir ama kontrol edelim)
+          for cfg in CONFIG_PSTORE CONFIG_PSTORE_CONSOLE CONFIG_PSTORE_RAM CONFIG_PSTORE_LAST_KMSG CONFIG_PSTORE_PMSG; do
+            if grep -q "^# ${cfg} is not set" "$DEFCONFIG"; then
+              sed -i "s/^# ${cfg} is not set/${cfg}=y/" "$DEFCONFIG"
+              echo "OK: ${cfg} acildi"
+            elif ! grep -q "^${cfg}=y" "$DEFCONFIG"; then
+              echo "${cfg}=y" >> "$DEFCONFIG"
+              echo "OK: ${cfg} satiri eklendi"
+            fi
+          done
+
+          echo "--- Son hali (SERIAL_MSM_GENI ve PSTORE satirlari) ---"
+          grep -E "CONFIG_SERIAL_MSM_GENI|CONFIG_PSTORE" "$DEFCONFIG"
+
+      - name: Kernel cmdline / earlycon kontrolu (bilgi amacli)
+        run: |
+          cd kernel_src
+          echo "--- trinket-qupv3.dtsi icindeki debug UART node'u ---"
+          grep -n -A3 "Debug UART Instance" arch/arm64/boot/dts/qcom/trinket-qupv3.dtsi || true
+          echo ""
+          echo "NOT: cmdline'daki earlycon=msm_geni_serial,0x4a90000 adresi"
+          echo "bu node ile eslesiyor olmali (qcom,msm-geni-console, 0x4a90000)."
+
+      - name: defconfig uygula
+        run: |
+          cd kernel_src
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+
+          make O=out ARCH=arm64 vendor/${{ github.event.inputs.defconfig }}
+
+      - name: Kernel derle
+        run: |
+          cd kernel_src
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-android-
+          export CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CC=clang
+          export PATH="$PWD/../toolchain/clang/bin:$PWD/../toolchain/gcc-aarch64/bin:$PATH"
+
+          # NOT: bu defconfig'te CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE=y ve
+          # CONFIG_BUILD_ARM64_DT_OVERLAY kapali; yani DTB zaten Image.gz-dtb
+          # icine gomuluyor, ayri bir dtbo.img hedefi bu kernel icin gecerli
+          # degil ve derlemeyi bosuna kirabilir. Sadece Image.gz-dtb istiyoruz.
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            Image.gz-dtb 2>&1 | tee build.log
+
+      - name: Derleme ciktilarini dogrula
+        run: |
+          cd kernel_src
+          echo "--- out/arch/arm64/boot icerigi ---"
+          ls -la out/arch/arm64/boot/ || true
+          test -f out/arch/arm64/boot/Image.gz-dtb && echo "OK: Image.gz-dtb var" || { echo "HATA: Image.gz-dtb uretilemedi, build.log'a bak"; exit 1; }
+
+      - name: Build log'unu her durumda sakla
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel_src/build.log
+          retention-days: 14
+
+      - name: AnyKernel3 template'i cek
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git anykernel
+
+      - name: Flashable zip hazirla
+        run: |
+          cd anykernel
+          # tools/ klasoru (magiskboot, ak3-core.sh vb.) oldugu gibi kalmali,
+          # sadece ornek ramdisk/patch klasorlerini ve gereksiz dosyalari temizle
+          rm -rf ramdisk patch .git *.md
+          cp ../kernel_src/out/arch/arm64/boot/Image.gz-dtb ./Image.gz-dtb
+
+          cat > anykernel.sh << 'EOF'
+          properties() { '
+          kernel.string=Ginkgo Custom Kernel (UART console acik)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=ginkgo
+          device.name2=willow
+          device.name3=laurel_sprout
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=0;
+
+          . tools/ak3-core.sh
+
+          dump_boot;
+          write_boot;
+          EOF
+
+          mkdir -p META-INF/com/google/android
+          cat > META-INF/com/google/android/update-binary << 'EOF'
+          #!/sbin/sh
+          OUTFD=/proc/self/fd/$2;
+          ZIPFILE="$3";
+          mkdir -p /tmp/anykernel/META-INF/com/google/android;
+          cd /tmp/anykernel;
+          unzip -o "$ZIPFILE";
+          chmod 755 tools/* anykernel.sh 2>/dev/null;
+          ./anykernel.sh "$2" "$OUTFD" "$ZIPFILE";
+          EOF
+          echo "#MAGISK" > META-INF/com/google/android/updater-script
+
+          zip -r9 ../Ginkgo-Kernel-UART-$(date +%Y%m%d-%H%M).zip . -x ".git*"
+
+      - name: Flashable zip'i yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ginkgo-kernel-flashable-zip
+          path: Ginkgo-Kernel-UART-*.zip
+          retention-days: 30
+
+      - name: Ham Image.gz-dtb'yi de yukle
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-kernel-image
+          path: kernel_src/out/arch/arm64/boot/Image.gz-dtb
+          retention-days: 30
