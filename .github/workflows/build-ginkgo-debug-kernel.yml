@@ -1,11 +1,13 @@
-name: Build Ginkgo Debug Kernel (UART/OneUI bring-up)
+name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
 
-# Bu workflow, ginkgo (Redmi Note 8/8T) için QuicksilveR kernel kaynağını
-# klonlar, defconfig'e UART/earlycon ve genel debug fragmanlarını enjekte
-# eder, derler ve AnyKernel3 ile flashlanabilir bir zip üretir.
+# Elindeki çalışan kernel Floppy Kernel (flopster101), kaynağı:
+#   https://github.com/FlopKernel-Series/flop_trinket-mi_kernel  (branch: floppy-unity)
+# Bu repo kendi build script'ini içeriyor: do_build.sh
+# Kendi make komutlarımızı tahmin etmek yerine BU script'i çalıştırıyoruz,
+# çünkü doğru defconfig/toolchain/flag seçimini zaten biliyor.
 #
-# Amaç: OneUI portunda boot ilerlerken oluşan hatayı UART üzerinden
-# görebilmek için kernel log çıktısını zorla açmak.
+# Amaç: aynı taban üzerine UART/earlycon debug config'lerini ekleyip
+# derleyerek, kernel başladıktan sonra UART'ın neden sessiz kaldığını görmek.
 
 on:
   workflow_dispatch:
@@ -13,19 +15,15 @@ on:
       kernel_repo:
         description: "Kernel kaynak reposu"
         required: true
-        default: "xdroid-devices/xd_kernel_xiaomi_ginkgo"
+        default: "FlopKernel-Series/flop_trinket-mi_kernel"
       kernel_branch:
-        description: "Branch (twelve = Android 12 taban, genelde en uyumlu)"
+        description: "Branch"
         required: true
-        default: "twelve"
-      defconfig:
-        description: "Defconfig dosya adı (arch/arm64/configs/vendor/ altında)"
-        required: true
-        default: "ginkgo-perf_defconfig"
+        default: "floppy-unity"
       anykernel_repo:
-        description: "AnyKernel3 flashable zip şablonu"
+        description: "Trinket'e özel AnyKernel3 şablonu"
         required: true
-        default: "osm0sis/AnyKernel3"
+        default: "FlopKernel-Series/AnyKernel3-trinket"
 
 jobs:
   build:
@@ -51,27 +49,36 @@ jobs:
           git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" \
             "https://github.com/${{ github.event.inputs.kernel_repo }}.git" kernel
           cd kernel && git log -1 --oneline
+          echo "--- do_build.sh içeriği ---"
+          cat do_build.sh || echo "do_build.sh bulunamadı, dosya listesi:"
+          ls -la
 
-      # Clang genelde bu tree'lerde beklenen toolchain; yoksa GCC'ye düşer.
-      - name: Fetch prebuilt Clang toolchain
-        run: |
-          mkdir -p toolchains/clang
-          curl -sL https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz \
-            | tar -xz -C toolchains/clang --strip-components=1 || \
-          curl -sL https://mirror.ghproxy.com/https://raw.githubusercontent.com/kdrag0n/proton-clang/master/README.md -o /dev/null
-          echo "${GITHUB_WORKSPACE}/toolchains/clang/bin" >> "$GITHUB_PATH"
-
-      - name: Apply debug config fragment
+      - name: Inspect build script and defconfig locations
         working-directory: kernel
         run: |
-          DEFCONFIG_PATH="arch/arm64/configs/vendor/${{ github.event.inputs.defconfig }}"
-          if [ ! -f "$DEFCONFIG_PATH" ]; then
-            DEFCONFIG_PATH=$(find . -name "${{ github.event.inputs.defconfig }}" | head -n1)
-          fi
-          echo "Using defconfig: $DEFCONFIG_PATH"
-          cat >> "$DEFCONFIG_PATH" << 'EOF'
+          echo "=== do_build.sh ==="
+          cat do_build.sh 2>/dev/null || true
+          echo "=== Olası defconfig dosyaları ==="
+          find . -iname "*ginkgo*defconfig*" -o -iname "*trinket*defconfig*" 2>/dev/null
+          find arch/arm64/configs -maxdepth 3 -type f 2>/dev/null | head -50
 
-          # ---- UART / early console ----
+      # do_build.sh muhtemelen kendi toolchain'ini indiriyor (AOSP Clang).
+      # Script'in kendi mantığını bozmamak için burada ayrıca toolchain
+      # indirmiyoruz — script'in PATH'i ne yapıyorsa onu izliyoruz.
+      - name: Apply UART/debug config fragment before build
+        working-directory: kernel
+        run: |
+          # do_build.sh'in kullandığı gerçek defconfig dosyasını bul
+          DEFCONFIG_PATH=$(find arch/arm64/configs -iname "*ginkgo*" -o -iname "*trinket*" 2>/dev/null | grep -v dts | head -n1)
+          if [ -z "$DEFCONFIG_PATH" ]; then
+            DEFCONFIG_PATH=$(find . -iname "vendor" -type d -path "*configs*" 2>/dev/null | head -n1)/ginkgo.config
+          fi
+          echo "Debug config eklenecek dosya: $DEFCONFIG_PATH"
+
+          if [ -f "$DEFCONFIG_PATH" ]; then
+            cat >> "$DEFCONFIG_PATH" << 'EOF'
+
+          # ---- UART / early console debug (bring-up amaçlı, geçici) ----
           CONFIG_SERIAL_MSM_GENI=y
           CONFIG_SERIAL_MSM_GENI_CONSOLE=y
           CONFIG_SERIAL_EARLYCON=y
@@ -86,8 +93,6 @@ jobs:
           CONFIG_PRINTK_PROCESS=y
           CONFIG_DYNAMIC_DEBUG=y
           CONFIG_LOG_BUF_SHIFT=21
-
-          # ---- Panik / crash görünürlüğü ----
           CONFIG_PSTORE=y
           CONFIG_PSTORE_CONSOLE=y
           CONFIG_PSTORE_RAM=y
@@ -98,116 +103,77 @@ jobs:
           CONFIG_MAGIC_SYSRQ=y
           CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=n
           CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=n
-
-          # ---- Bootloader / init debug ----
-          CONFIG_INITRAMFS_COMPRESSION_NONE=y
-
-          # ---- F2FS debug (bir önceki oturumdaki data mount sorunları için) ----
-          CONFIG_F2FS_STAT_FS=y
-          CONFIG_F2FS_FS_DEBUG=y
-          CONFIG_F2FS_CHECK_FS=y
+          CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"
+          CONFIG_CMDLINE_EXTEND=y
           EOF
-
-      - name: Detect real UART console name from DTS
-        working-directory: kernel
-        id: uartdetect
-        run: |
-          # SBL/bootloader zaten senin lehimlediğin pinlere log basabiliyor,
-          # yani fiziksel bağlantı ve DTS pinctrl doğru — sorun kernel'in bu
-          # node'u console olarak register etmemesi. Burada gerçek alias'ı
-          # (serial0 = &xxx) DTS'ten okuyup doğru ttyMSMx numarasını buluyoruz,
-          # tahmin etmiyoruz.
-          GINKGO_DTS=$(find . -path "*/dts/*" \( -iname "*ginkgo*" -o -iname "*trinket*" \) 2>/dev/null | head -n1)
-          echo "Bulunan DTS/DTSI adayı: $GINKGO_DTS"
-
-          ALIAS_LINE=$(grep -rhoE "serial0\s*=\s*&[a-zA-Z0-9_]+" arch/arm64/boot/dts/ 2>/dev/null | grep -i "trinket\|ginkgo\|uart" | head -n1)
-          if [ -z "$ALIAS_LINE" ]; then
-            ALIAS_LINE=$(grep -rhoE "serial0\s*=\s*&[a-zA-Z0-9_]+" arch/arm64/boot/dts/ 2>/dev/null | head -n1)
-          fi
-          echo "serial0 alias: $ALIAS_LINE"
-
-          # Bu platformda (trinket/SM6125, GENI SE UART) driver ismi ttyMSM
-          # olarak register olur; index genelde 0. Bulamazsak güvenli varsayılan.
-          CONSOLE_NAME="ttyMSM0"
-          echo "console_name=$CONSOLE_NAME" >> "$GITHUB_OUTPUT"
-          echo "Kullanılacak console adı: $CONSOLE_NAME (bootloader zaten bu pinlere yazabiliyor, kernel driver'ı bu isimle register edecek)"
-
-      - name: Patch cmdline for verbose UART output
-        working-directory: kernel
-        run: |
-          CONSOLE_NAME="${{ steps.uartdetect.outputs.console_name }}"
-          CMDLINE_STR="console=${CONSOLE_NAME},115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"
-          echo "Enjekte edilecek cmdline eki: $CMDLINE_STR"
-
-          # 1) DTS chosen{} node'unda bootargs varsa güçlendir
-          CHOSEN_FILES=$(grep -rl "bootargs" arch/arm64/boot/dts/ 2>/dev/null | grep -i "trinket\|ginkgo" || true)
-          for f in $CHOSEN_FILES; do
-            echo "Patching $f"
-            sed -i "s|bootargs = \"\(.*\)\";|bootargs = \"\1 ${CMDLINE_STR}\";|" "$f"
-          done
-
-          # 2) Kernel'in kendi CONFIG_CMDLINE'ına da aynısını ekle (defconfig fallback)
-          DEFCONFIG_PATH="arch/arm64/configs/vendor/${{ github.event.inputs.defconfig }}"
-          if ! grep -q "CONFIG_CMDLINE" "$DEFCONFIG_PATH" 2>/dev/null; then
-            echo "CONFIG_CMDLINE=\"${CMDLINE_STR}\"" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_CMDLINE_FORCE=y" >> "$DEFCONFIG_PATH"
+            echo "Config eklendi."
+          else
+            echo "::warning::Defconfig otomatik bulunamadı, do_build.sh log'undaki gerçek yolu görüp manuel ekleyeceğiz."
           fi
 
-          echo "NOT: AnyKernel3 paketleme adımında boot.img cmdline'ı da ayrıca override edilecek (en garanti yol)."
-
-      - name: Build kernel
+      - name: Run kernel's own build script
         working-directory: kernel
-        env:
-          ARCH: arm64
-          SUBARCH: arm64
         run: |
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export KBUILD_BUILD_USER=actions
-          export KBUILD_BUILD_HOST=github
+          chmod +x do_build.sh
+          # do_build.sh interaktif bir menü/prompt bekliyorsa burada patlar;
+          # log çıktısına göre ikinci deneme adımda flag/env ayarlarız.
+          ./do_build.sh 2>&1 | tee build.log || true
 
-          make O=out ARCH=arm64 vendor/${{ github.event.inputs.defconfig }}
-          make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang \
-            CROSS_COMPILE=$CROSS_COMPILE \
-            CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
-            CLANG_TRIPLE=$CLANG_TRIPLE \
-            2>&1 | tee build.log
+      - name: Fallback manual build (if do_build.sh failed or needs args)
+        working-directory: kernel
+        if: always()
+        run: |
+          if [ ! -f build.log ] || ! grep -qi "Image" build.log; then
+            echo "do_build.sh çıktısında Image bulunamadı, manuel build deneniyor."
+            export ARCH=arm64
+            export SUBARCH=arm64
+            export CROSS_COMPILE=aarch64-linux-gnu-
+            export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            DEFCONFIG_NAME=$(find arch/arm64/configs -iname "*ginkgo*defconfig*" -o -iname "*trinket*defconfig*" | head -n1 | xargs -n1 basename 2>/dev/null)
+            echo "Denenen defconfig: $DEFCONFIG_NAME"
+            if [ -n "$DEFCONFIG_NAME" ]; then
+              make O=out ARCH=arm64 "$DEFCONFIG_NAME"
+              make -j$(nproc) O=out ARCH=arm64 \
+                CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+                OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+                CROSS_COMPILE=$CROSS_COMPILE \
+                CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
+                2>&1 | tee -a build.log
+            fi
+          fi
 
       - name: Check build output
         working-directory: kernel
         run: |
-          find out -name "Image*" -o -name "*.dtb" | tee found_artifacts.txt
+          find . -name "Image*" -newer do_build.sh 2>/dev/null | tee found_artifacts.txt
+          find out -name "Image*" 2>/dev/null | tee -a found_artifacts.txt
           if [ ! -s found_artifacts.txt ]; then
-            echo "::error::Kernel Image üretilemedi, build.log'a bak"
+            echo "::error::Kernel Image üretilemedi, build.log'un son 200 satırı:"
             tail -n 200 build.log
             exit 1
           fi
+          echo "Bulunan Image dosyaları:"
+          cat found_artifacts.txt
 
-      - name: Clone AnyKernel3
+      - name: Clone trinket-specific AnyKernel3
         run: |
           git clone --depth=1 "https://github.com/${{ github.event.inputs.anykernel_repo }}.git" AnyKernel3
 
       - name: Package flashable zip
         run: |
-          IMG=$(find kernel/out -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" | head -n1)
-          cp "$IMG" AnyKernel3/Image.gz-dtb || cp "$IMG" AnyKernel3/Image
-          # DTB ayrı üretiliyorsa ekle
-          find kernel/out -iname "*ginkgo*.dtb" -exec cp {} AnyKernel3/dtb \; || true
+          IMG=$(find kernel -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" 2>/dev/null | grep -v uploads | head -n1)
+          echo "Kullanılan Image: $IMG"
+          cp "$IMG" AnyKernel3/ 2>/dev/null || true
 
-          # AnyKernel3'ün kendi cmdline override'ını da doldur — ROM'un boot.img'i
-          # kendi cmdline'ını taşısa bile bu satır flash sırasında onu ezer.
-          # Bu, kernel içi CONFIG_CMDLINE'a göre daha garanti bir yoldur.
-          CONSOLE_NAME="${{ steps.uartdetect.outputs.console_name }}"
-          if grep -q "^cmdline=" AnyKernel3/anykernel.sh; then
-            sed -i "s|^cmdline=.*|cmdline=\"console=${CONSOLE_NAME},115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug\"|" AnyKernel3/anykernel.sh
-          else
-            sed -i "/^properties()/i cmdline=\"console=${CONSOLE_NAME},115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug\"" AnyKernel3/anykernel.sh
+          # cmdline'ı AnyKernel3 seviyesinde de garantiye al
+          if [ -f AnyKernel3/anykernel.sh ]; then
+            if grep -q "^cmdline=" AnyKernel3/anykernel.sh; then
+              sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"|' AnyKernel3/anykernel.sh
+            fi
           fi
 
           cd AnyKernel3
-          zip -r9 ../ginkgo-debug-kernel-$(date +%Y%m%d-%H%M).zip . -x ".git*"
+          zip -r9 ../ginkgo-floppy-debug-kernel-$(date +%Y%m%d-%H%M).zip . -x ".git*"
 
       - name: Upload build log (her zaman)
         if: always()
@@ -219,5 +185,5 @@ jobs:
       - name: Upload flashable kernel zip
         uses: actions/upload-artifact@v4
         with:
-          name: ginkgo-debug-kernel
-          path: ginkgo-debug-kernel-*.zip
+          name: ginkgo-floppy-debug-kernel
+          path: ginkgo-floppy-debug-kernel-*.zip
