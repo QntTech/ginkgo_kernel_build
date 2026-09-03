@@ -9,20 +9,35 @@ name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
 # Amaç: aynı taban üzerine UART/earlycon debug config'lerini ekleyip
 # derleyerek, kernel başladıktan sonra UART'ın neden sessiz kaldığını görmek.
 #
-# EK (bu revizyon): netd/zygote SIGKILL kısır döngüsünü kıran kernel-seviyesi
-# SELinux permissive zorlaması eklendi. Sebep: boot log analizinde netd,
-# "dumplog_data_file" (Samsung/OneUI-özel, A35'ten kalma sepolicy etiketi)
-# dizinine erişirken AVC denied alıyor (permissive=0 — yani cmdline'daki
-# androidboot.selinux=permissive bu kural için dinlenmiyor, gerçek enforcing
-# çalışıyor), netd bu EACCES'i yönetemeyip abort() ile çöküyor, bootchecker
-# zygote'u/netd'yi sürekli restart ediyor. ginkgo'nun sepolicy'sinde bu
-# Samsung-özel dizin/kural yok; build sistemiyle sepolicy düzeltmek yerine
-# kernel'i CONFIG_SECURITY_SELINUX_BOOTPARAM ile varsayılan permissive
-# başlatacak şekilde ayarlıyoruz, böylece hiçbir domain/kural için AVC
-# denied artık abort/EACCES üretmez, sadece loglanır.
+# EK (bu revizyon - v2): önceki revizyonda eklenen
+# CONFIG_SECURITY_SELINUX_BOOTPARAM=y / VALUE=0 YETERSİZ ÇIKTI.
+# UART log'u gösterdi ki: kernel gerçekten permissive (old_enforcing=0)
+# başlıyor, AMA init policy'yi yükledikten hemen sonra kendi
+# security_setenforce(1) çağrısını yapıp enforcing'e zorluyor
+# (log: "enforcing=1 old_enforcing=0" + "Init cannot set 'ro.boot.selinux'
+# to 'permissive': Read-only property was already set"). Bu, init
+# binary'sinin ALLOW_PERMISSIVE_SELINUX olmadan derlenmiş olmasından
+# kaynaklanıyor (OneUI/A35 prebuilt init, production/Knox sertleştirmesi)
+# - yani init kernel cmdline'daki androidboot.selinux=permissive'i
+# görmezden gelip her zaman enforcing'e geçmeye çalışıyor.
 #
-# Mevcut UART/earlycon/pstore/log debug ayarlarına dokunulmadı, sadece
-# SELinux bloğu eklendi.
+# Config bayrağı sadece "varsayılan başlangıç değerini" belirliyor,
+# userspace'in SONRADAN /sys/fs/selinux/enforce'a yazıp değiştirmesini
+# ENGELLEMİYOR. O yüzden artık security/selinux/selinuxfs.c içindeki
+# sel_write_enforce() fonksiyonunu KAYNAK SEVİYESİNDE patch'liyoruz:
+# userspace ne yazarsa yazsın (init'in setenforce(1) çağrısı dahil),
+# kernel bunu her zaman "0" (permissive) olarak işliyor. init "enforcing'e
+# geçtim" sanıyor ama kernel gerçekte hiç geçmiyor, AVC denied'lar hâlâ
+# loglanıyor (dmesg/audit'te görünmeye devam eder) ama artık hiçbiri
+# EACCES/abort() üretmiyor. Bu, netd'nin A35'ten kalma
+# "dumplog_data_file" (Samsung/OneUI-özel sepolicy etiketi, ginkgo'da
+# karşılığı yok) dizinine erişirken aldığı AVC denied yüzünden abort()
+# ile çöküp bootchecker'ın onu (ve zygote'u) sürekli restart ettiği
+# kısır döngüyü kırmak için.
+#
+# Mevcut UART/earlycon/pstore/log debug ayarlarına dokunulmadı, önceki
+# config bloğu da (zararı olmadığı, ayrıca varsayılan durumu doğru
+# ayarladığı için) bırakıldı - asıl işi şimdi kaynak patch'i yapıyor.
 
 on:
   workflow_dispatch:
@@ -106,14 +121,8 @@ jobs:
           CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=n
           CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=n
 
-          # ---- SELinux: gerçek/global permissive zorlaması ----
-          # netd, A35'ten kalma Samsung-özel "dumplog_data_file" sepolicy
-          # etiketine sahip bir dizine erişmeye çalışıyor, ginkgo'nun
-          # sepolicy'sinde bu kural yok, AVC denied -> netd abort() ->
-          # bootchecker sürekli netd/zygote'u restart ediyor (kısır döngü).
-          # androidboot.selinux=permissive cmdline etiketi bu kural için
-          # dinlenmiyordu (permissive=0 log'da görüldü), o yüzden bunu
-          # kernel config seviyesinde zorluyoruz.
+          # ---- SELinux: varsayılan başlangıç durumu (yetersiz tek başına,
+          #      asıl zorlama aşağıdaki kaynak patch'inde - bkz. bir sonraki step) ----
           CONFIG_SECURITY_SELINUX_BOOTPARAM=y
           CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0
           CONFIG_SECURITY_SELINUX_DEVELOP=y
@@ -123,6 +132,65 @@ jobs:
           EOF
           echo "Config eklendi, son 30 satır:"
           tail -30 "$DEFCONFIG_PATH"
+
+      # ASIL FİX BURADA: init'in setenforce(1) çağrısını kernel seviyesinde
+      # etkisiz hale getiriyoruz. sel_write_enforce() /sys/fs/selinux/enforce
+      # yazma işleyicisidir; userspace'ten gelen değeri okuduktan hemen sonra
+      # 0'a sabitliyoruz, böylece init "enforcing'e geçtim" sanır ama
+      # selinux_enforcing hep 0 kalır. AVC denied'lar loglanmaya devam eder
+      # (audit_log çağrısı dokunulmadan kalıyor), sadece artık gerçek bir
+      # engelleme/EACCES üretmiyorlar.
+      - name: Patch sel_write_enforce() to ignore userspace enforcing requests
+        working-directory: kernel
+        run: |
+          SELINUXFS="security/selinux/selinuxfs.c"
+          if [ ! -f "$SELINUXFS" ]; then
+            echo "::error::$SELINUXFS bulunamadı, kernel ağacı beklenenden farklı yapıda olabilir."
+            find . -name "selinuxfs.c" -not -path "./.git/*"
+            exit 1
+          fi
+
+          echo "=== Patch öncesi sel_write_enforce (ilgili kısım) ==="
+          grep -n "sel_write_enforce" -A 25 "$SELINUXFS" | head -40
+
+          # sscanf ile new_value okunduktan hemen sonra 0'a sabitliyoruz.
+          # Farklı kernel sürümlerinde tam biçim değişebildiği için birkaç
+          # olası kalıbı sırayla deniyoruz, ilk eşleşen uygulanır.
+          PATCHED=0
+
+          if ! grep -q "FORCE PERMISSIVE PATCH" "$SELINUXFS"; then
+            if grep -q 'if (sscanf(page, "%d", &new_value) != 1)' "$SELINUXFS"; then
+              python3 - "$SELINUXFS" << 'PYEOF'
+          import sys
+          path = sys.argv[1]
+          with open(path, "r") as f:
+              content = f.read()
+
+          marker = 'if (sscanf(page, "%d", &new_value) != 1)\n\t\tgoto out;'
+          if marker in content:
+              replacement = marker + '\n\n\t/* FORCE PERMISSIVE PATCH: ignore whatever userspace (init) requests,\n\t * always keep the kernel in permissive mode. AVC denials are still\n\t * logged below via audit_log(), they just never become blocking. */\n\tnew_value = 0;'
+              content = content.replace(marker, replacement, 1)
+              with open(path, "w") as f:
+                  f.write(content)
+              print("PATCH_OK")
+          else:
+              print("PATCH_MARKER_NOT_FOUND")
+          PYEOF
+              if grep -q "FORCE PERMISSIVE PATCH" "$SELINUXFS"; then
+                PATCHED=1
+              fi
+            fi
+          fi
+
+          if [ "$PATCHED" -eq 0 ]; then
+            echo "::error::Otomatik patch uygulanamadı - sel_write_enforce fonksiyonunun tam hali beklenenden farklı."
+            echo "İlgili fonksiyonun tam içeriği (elle bakıp adapte etmek için):"
+            grep -n "sel_write_enforce" -A 40 "$SELINUXFS"
+            exit 1
+          fi
+
+          echo "=== Patch sonrası sel_write_enforce (ilgili kısım) ==="
+          grep -n "sel_write_enforce" -A 30 "$SELINUXFS" | head -45
 
       - name: Run kernel's own build script
         working-directory: kernel
