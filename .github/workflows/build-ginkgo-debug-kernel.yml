@@ -143,6 +143,7 @@ jobs:
       - name: Patch sel_write_enforce() to ignore userspace enforcing requests
         working-directory: kernel
         run: |
+          set -eu
           SELINUXFS="security/selinux/selinuxfs.c"
           if [ ! -f "$SELINUXFS" ]; then
             echo "::error::$SELINUXFS bulunamadı, kernel ağacı beklenenden farklı yapıda olabilir."
@@ -150,47 +151,78 @@ jobs:
             exit 1
           fi
 
-          echo "=== Patch öncesi sel_write_enforce (ilgili kısım) ==="
-          grep -n "sel_write_enforce" -A 25 "$SELINUXFS" | head -40
-
-          # sscanf ile new_value okunduktan hemen sonra 0'a sabitliyoruz.
-          # Farklı kernel sürümlerinde tam biçim değişebildiği için birkaç
-          # olası kalıbı sırayla deniyoruz, ilk eşleşen uygulanır.
-          PATCHED=0
-
-          if ! grep -q "FORCE PERMISSIVE PATCH" "$SELINUXFS"; then
-            if grep -q 'if (sscanf(page, "%d", &new_value) != 1)' "$SELINUXFS"; then
-              python3 - "$SELINUXFS" << 'PYEOF'
-          import sys
-          path = sys.argv[1]
-          with open(path, "r") as f:
-              content = f.read()
-
-          marker = 'if (sscanf(page, "%d", &new_value) != 1)\n\t\tgoto out;'
-          if marker in content:
-              replacement = marker + '\n\n\t/* FORCE PERMISSIVE PATCH: ignore whatever userspace (init) requests,\n\t * always keep the kernel in permissive mode. AVC denials are still\n\t * logged below via audit_log(), they just never become blocking. */\n\tnew_value = 0;'
-              content = content.replace(marker, replacement, 1)
-              with open(path, "w") as f:
-                  f.write(content)
-              print("PATCH_OK")
-          else:
-              print("PATCH_MARKER_NOT_FOUND")
-          PYEOF
-              if grep -q "FORCE PERMISSIVE PATCH" "$SELINUXFS"; then
-                PATCHED=1
-              fi
-            fi
+          if grep -q "FORCE PERMISSIVE PATCH" "$SELINUXFS"; then
+            echo "Zaten patch'lenmiş, tekrar patch'lemiyorum."
+            exit 0
           fi
 
-          if [ "$PATCHED" -eq 0 ]; then
-            echo "::error::Otomatik patch uygulanamadı - sel_write_enforce fonksiyonunun tam hali beklenenden farklı."
-            echo "İlgili fonksiyonun tam içeriği (elle bakıp adapte etmek için):"
-            grep -n "sel_write_enforce" -A 40 "$SELINUXFS"
+          echo "=== sel_write_enforce - patch öncesi (satır numaralı) ==="
+          grep -n "sel_write_enforce" "$SELINUXFS"
+          FUNC_START=$(grep -n "^static ssize_t sel_write_enforce" "$SELINUXFS" | head -1 | cut -d: -f1)
+          if [ -z "$FUNC_START" ]; then
+            echo "::error::sel_write_enforce fonksiyon başlangıcı bulunamadı, dosya yapısı beklenenden farklı."
+            grep -n "write_enforce\|sscanf" "$SELINUXFS" || true
+            exit 1
+          fi
+          echo "Fonksiyon $FUNC_START. satırda başlıyor, sonraki 40 satır:"
+          sed -n "${FUNC_START},$((FUNC_START+40))p" "$SELINUXFS"
+
+          # Fonksiyon gövdesi içinde (başlangıçtan sonraki ~40 satırda) sscanf
+          # çağrısının bulunduğu satırı ara - bu satır userspace'ten gelen
+          # new_value'yu okur. Tam metin eşleşmesi yerine satır numarası +
+          # basit substring araması kullanıyoruz, whitespace/quoting'e karşı
+          # kırılgan olmasın diye (önceki python heredoc denemesi girinti
+          # yüzünden sessizce başarısız olmuştu).
+          SSCANF_LINE=$(awk -v start="$FUNC_START" -v end="$((FUNC_START+60))" \
+            'NR>=start && NR<=end && /sscanf/ {print NR; exit}' "$SELINUXFS")
+          if [ -z "$SSCANF_LINE" ]; then
+            echo "::error::sscanf satırı sel_write_enforce içinde bulunamadı."
+            exit 1
+          fi
+          echo "sscanf çağrısı $SSCANF_LINE. satırda bulundu:"
+          sed -n "${SSCANF_LINE}p" "$SELINUXFS"
+
+          # sscanf'ten sonraki ilk ";" ile biten satırı (genelde "goto out;")
+          # bul, patch'i onun HEMEN ALTINA ekle - böylece hem tek satırlık
+          # "if (sscanf(...) != 1) goto out;" hem de iki satıra bölünmüş
+          # hali için çalışır.
+          INSERT_AFTER=$(awk -v s="$SSCANF_LINE" -v end="$((SSCANF_LINE+3))" \
+            'NR>=s && NR<=end && /;/ {print NR; exit}' "$SELINUXFS")
+          if [ -z "$INSERT_AFTER" ]; then
+            echo "::error::sscanf sonrası satır bulunamadı."
+            exit 1
+          fi
+          echo "Patch, ${INSERT_AFTER}. satırdan sonra eklenecek:"
+          sed -n "${INSERT_AFTER}p" "$SELINUXFS"
+
+          # sed 'r <dosya>' ile ekleme: metni önce düz bir dosyaya yazıp
+          # (heredoc'un YAML'dan miras aldığı baştaki boşluklar C için
+          # zararsız - Python'daki gibi girintiye duyarlı değil), sonra
+          # sed'e sadece dosya adını veriyoruz. Hiçbir escape/quoting riski
+          # yok - önceki "a\" denemesinde yaşanan sorunun kökü buydu.
+          # Not: heredoc kasıtlı olarak kullanılmıyor - YAML blok metninin
+          # girinti kuralı ile bash heredoc'un "bitiş etiketi flush-left
+          # olmalı" kuralı çelişiyor (biri boşluk ister, diğeri boşluksuz).
+          # printf ile gerçek \n karakteri üretmek, girintiden tamamen
+          # bağımsız ve tek satırlık - hiçbir çelişki yok.
+          printf '\n    /* FORCE PERMISSIVE PATCH: ignore whatever userspace (init) requests,\n     * always keep the kernel in permissive mode. AVC denials are still\n     * logged below via audit_log(), they just never become blocking. */\n    new_value = 0;\n' > /tmp/selinux_patch_snippet.txt
+          sed -i "${INSERT_AFTER}r /tmp/selinux_patch_snippet.txt" "$SELINUXFS"
+
+          if ! grep -q "FORCE PERMISSIVE PATCH" "$SELINUXFS"; then
+            echo "::error::Patch eklendi ama marker dosyada bulunamadı, sed başarısız olmuş olabilir."
             exit 1
           fi
 
-          echo "=== Patch sonrası sel_write_enforce (ilgili kısım) ==="
-          grep -n "sel_write_enforce" -A 30 "$SELINUXFS" | head -45
+          echo "=== sel_write_enforce - patch sonrası (satır numaralı) ==="
+          sed -n "${FUNC_START},$((FUNC_START+45))p" "$SELINUXFS"
+
+          echo "=== Doğrulama: new_value = 0; satırı gerçekten sscanf'ten SONRA mı? ==="
+          NEWVAL_LINE=$(grep -n "new_value = 0;" "$SELINUXFS" | head -1 | cut -d: -f1)
+          if [ -z "$NEWVAL_LINE" ] || [ "$NEWVAL_LINE" -le "$SSCANF_LINE" ]; then
+            echo "::error::new_value = 0; satırı sscanf'ten önce ya da hiç yok - patch mantığı bozuk."
+            exit 1
+          fi
+          echo "OK: new_value = 0; satır $NEWVAL_LINE, sscanf satır $SSCANF_LINE'den sonra - sıralama doğru."
 
       - name: Run kernel's own build script
         working-directory: kernel
