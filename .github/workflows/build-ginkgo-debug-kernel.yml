@@ -8,6 +8,21 @@ name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
 #
 # Amaç: aynı taban üzerine UART/earlycon debug config'lerini ekleyip
 # derleyerek, kernel başladıktan sonra UART'ın neden sessiz kaldığını görmek.
+#
+# EK (bu revizyon): netd/zygote SIGKILL kısır döngüsünü kıran kernel-seviyesi
+# SELinux permissive zorlaması eklendi. Sebep: boot log analizinde netd,
+# "dumplog_data_file" (Samsung/OneUI-özel, A35'ten kalma sepolicy etiketi)
+# dizinine erişirken AVC denied alıyor (permissive=0 — yani cmdline'daki
+# androidboot.selinux=permissive bu kural için dinlenmiyor, gerçek enforcing
+# çalışıyor), netd bu EACCES'i yönetemeyip abort() ile çöküyor, bootchecker
+# zygote'u/netd'yi sürekli restart ediyor. ginkgo'nun sepolicy'sinde bu
+# Samsung-özel dizin/kural yok; build sistemiyle sepolicy düzeltmek yerine
+# kernel'i CONFIG_SECURITY_SELINUX_BOOTPARAM ile varsayılan permissive
+# başlatacak şekilde ayarlıyoruz, böylece hiçbir domain/kural için AVC
+# denied artık abort/EACCES üretmez, sadece loglanır.
+#
+# Mevcut UART/earlycon/pstore/log debug ayarlarına dokunulmadı, sadece
+# SELinux bloğu eklendi.
 
 on:
   workflow_dispatch:
@@ -90,11 +105,24 @@ jobs:
           CONFIG_MAGIC_SYSRQ=y
           CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=n
           CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=n
-          CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"
+
+          # ---- SELinux: gerçek/global permissive zorlaması ----
+          # netd, A35'ten kalma Samsung-özel "dumplog_data_file" sepolicy
+          # etiketine sahip bir dizine erişmeye çalışıyor, ginkgo'nun
+          # sepolicy'sinde bu kural yok, AVC denied -> netd abort() ->
+          # bootchecker sürekli netd/zygote'u restart ediyor (kısır döngü).
+          # androidboot.selinux=permissive cmdline etiketi bu kural için
+          # dinlenmiyordu (permissive=0 log'da görüldü), o yüzden bunu
+          # kernel config seviyesinde zorluyoruz.
+          CONFIG_SECURITY_SELINUX_BOOTPARAM=y
+          CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0
+          CONFIG_SECURITY_SELINUX_DEVELOP=y
+
+          CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive"
           CONFIG_CMDLINE_EXTEND=y
           EOF
-          echo "Config eklendi, son 25 satır:"
-          tail -25 "$DEFCONFIG_PATH"
+          echo "Config eklendi, son 30 satır:"
+          tail -30 "$DEFCONFIG_PATH"
 
       - name: Run kernel's own build script
         working-directory: kernel
@@ -145,7 +173,7 @@ jobs:
 
             if [ -f ../AnyKernel3/anykernel.sh ]; then
               if grep -q "^cmdline=" ../AnyKernel3/anykernel.sh; then
-                sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"|' ../AnyKernel3/anykernel.sh
+                sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive"|' ../AnyKernel3/anykernel.sh
               fi
             fi
 
