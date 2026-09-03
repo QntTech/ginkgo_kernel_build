@@ -53,30 +53,17 @@ jobs:
           cat do_build.sh || echo "do_build.sh bulunamadı, dosya listesi:"
           ls -la
 
-      - name: Inspect build script and defconfig locations
-        working-directory: kernel
-        run: |
-          echo "=== do_build.sh ==="
-          cat do_build.sh 2>/dev/null || true
-          echo "=== Olası defconfig dosyaları ==="
-          find . -iname "*ginkgo*defconfig*" -o -iname "*trinket*defconfig*" 2>/dev/null
-          find arch/arm64/configs -maxdepth 3 -type f 2>/dev/null | head -50
-
       # do_build.sh muhtemelen kendi toolchain'ini indiriyor (AOSP Clang).
       # Script'in kendi mantığını bozmamak için burada ayrıca toolchain
       # indirmiyoruz — script'in PATH'i ne yapıyorsa onu izliyoruz.
       - name: Apply UART/debug config fragment before build
         working-directory: kernel
         run: |
-          # do_build.sh'in kullandığı gerçek defconfig dosyasını bul
-          DEFCONFIG_PATH=$(find arch/arm64/configs -iname "*ginkgo*" -o -iname "*trinket*" 2>/dev/null | grep -v dts | head -n1)
-          if [ -z "$DEFCONFIG_PATH" ]; then
-            DEFCONFIG_PATH=$(find . -iname "vendor" -type d -path "*configs*" 2>/dev/null | head -n1)/ginkgo.config
-          fi
+          # Doğrulandı: gerçek defconfig fragmanı arch/arm64/configs/vendor/ginkgo.config
+          DEFCONFIG_PATH="arch/arm64/configs/vendor/ginkgo.config"
           echo "Debug config eklenecek dosya: $DEFCONFIG_PATH"
 
-          if [ -f "$DEFCONFIG_PATH" ]; then
-            cat >> "$DEFCONFIG_PATH" << 'EOF'
+          cat >> "$DEFCONFIG_PATH" << 'EOF'
 
           # ---- UART / early console debug (bring-up amaçlı, geçici) ----
           CONFIG_SERIAL_MSM_GENI=y
@@ -106,74 +93,65 @@ jobs:
           CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"
           CONFIG_CMDLINE_EXTEND=y
           EOF
-            echo "Config eklendi."
-          else
-            echo "::warning::Defconfig otomatik bulunamadı, do_build.sh log'undaki gerçek yolu görüp manuel ekleyeceğiz."
-          fi
+          echo "Config eklendi, son 25 satır:"
+          tail -25 "$DEFCONFIG_PATH"
 
       - name: Run kernel's own build script
         working-directory: kernel
         run: |
+          # do_build.sh kullanımı: ./do_build.sh <device> <options>
+          # device: ginkgo | laurel_sprout | all
+          # options: k=KernelSU, s=SukiSU, x=XXKSU, c=clean, f=force tüm varyantlar
+          # Vanilla (rootsuz) + temiz build için sade "ginkgo" veriyoruz.
           chmod +x do_build.sh
-          # do_build.sh interaktif bir menü/prompt bekliyorsa burada patlar;
-          # log çıktısına göre ikinci deneme adımda flag/env ayarlarız.
-          ./do_build.sh 2>&1 | tee build.log || true
-
-      - name: Fallback manual build (if do_build.sh failed or needs args)
-        working-directory: kernel
-        if: always()
-        run: |
-          if [ ! -f build.log ] || ! grep -qi "Image" build.log; then
-            echo "do_build.sh çıktısında Image bulunamadı, manuel build deneniyor."
-            export ARCH=arm64
-            export SUBARCH=arm64
-            export CROSS_COMPILE=aarch64-linux-gnu-
-            export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-            DEFCONFIG_NAME=$(find arch/arm64/configs -iname "*ginkgo*defconfig*" -o -iname "*trinket*defconfig*" | head -n1 | xargs -n1 basename 2>/dev/null)
-            echo "Denenen defconfig: $DEFCONFIG_NAME"
-            if [ -n "$DEFCONFIG_NAME" ]; then
-              make O=out ARCH=arm64 "$DEFCONFIG_NAME"
-              make -j$(nproc) O=out ARCH=arm64 \
-                CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-                OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-                CROSS_COMPILE=$CROSS_COMPILE \
-                CROSS_COMPILE_ARM32=$CROSS_COMPILE_ARM32 \
-                2>&1 | tee -a build.log
-            fi
-          fi
+          ./do_build.sh ginkgo c 2>&1 | tee build.log
 
       - name: Check build output
         working-directory: kernel
         run: |
-          find . -name "Image*" -newer do_build.sh 2>/dev/null | tee found_artifacts.txt
-          find out -name "Image*" 2>/dev/null | tee -a found_artifacts.txt
+          echo "=== build/ dizini içeriği (ckbuild.sh muhtemelen buraya yazıyor) ==="
+          find build -maxdepth 4 2>/dev/null
+          echo "=== Tüm Image adaylarını ara ==="
+          find . \( -name "Image*" -o -name "*.dtb" -o -name "*anykernel*.zip" \) \
+            -not -path "./.git/*" 2>/dev/null | tee found_artifacts.txt
           if [ ! -s found_artifacts.txt ]; then
             echo "::error::Kernel Image üretilemedi, build.log'un son 200 satırı:"
             tail -n 200 build.log
             exit 1
           fi
-          echo "Bulunan Image dosyaları:"
+          echo "Bulunan dosyalar:"
           cat found_artifacts.txt
 
-      - name: Clone trinket-specific AnyKernel3
+      - name: Clone trinket-specific AnyKernel3 (fallback packaging)
         run: |
-          git clone --depth=1 "https://github.com/${{ github.event.inputs.anykernel_repo }}.git" AnyKernel3
+          # Eğer ckbuild.sh zaten kendi flashable zip'ini ürettiyse bu adım
+          # sadece yedek; asıl zip found_artifacts.txt'te *anykernel*.zip
+          # olarak görünüyorsa onu kullanacağız.
+          git clone --depth=1 "https://github.com/${{ github.event.inputs.anykernel_repo }}.git" AnyKernel3 || true
 
       - name: Package flashable zip
         run: |
-          IMG=$(find kernel -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" 2>/dev/null | grep -v uploads | head -n1)
-          echo "Kullanılan Image: $IMG"
-          cp "$IMG" AnyKernel3/ 2>/dev/null || true
+          cd kernel
+          # 1) ckbuild.sh zaten bir flashable zip ürettiyse onu direkt kullan
+          READY_ZIP=$(find . -iname "*anykernel*.zip" -o -iname "*ginkgo*.zip" 2>/dev/null | grep -v "^./AnyKernel3" | head -n1)
+          if [ -n "$READY_ZIP" ]; then
+            echo "Hazır zip bulundu: $READY_ZIP"
+            cp "$READY_ZIP" "../ginkgo-floppy-debug-kernel-$(date +%Y%m%d-%H%M).zip"
+          else
+            echo "Hazır zip yok, Image'i manuel AnyKernel3'e paketliyoruz."
+            IMG=$(find . -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" 2>/dev/null | head -n1)
+            echo "Kullanılan Image: $IMG"
+            cp "$IMG" ../AnyKernel3/ 2>/dev/null || true
 
-          # cmdline'ı AnyKernel3 seviyesinde de garantiye al
-          if [ -f AnyKernel3/anykernel.sh ]; then
-            if grep -q "^cmdline=" AnyKernel3/anykernel.sh; then
-              sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"|' AnyKernel3/anykernel.sh
+            if [ -f ../AnyKernel3/anykernel.sh ]; then
+              if grep -q "^cmdline=" ../AnyKernel3/anykernel.sh; then
+                sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug"|' ../AnyKernel3/anykernel.sh
+              fi
             fi
-          fi
 
-          cd AnyKernel3
-          zip -r9 ../ginkgo-floppy-debug-kernel-$(date +%Y%m%d-%H%M).zip . -x ".git*"
+            cd ../AnyKernel3
+            zip -r9 "../ginkgo-floppy-debug-kernel-$(date +%Y%m%d-%H%M).zip" . -x ".git*"
+          fi
 
       - name: Upload build log (her zaman)
         if: always()
