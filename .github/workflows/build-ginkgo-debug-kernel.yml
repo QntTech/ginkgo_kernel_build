@@ -9,35 +9,45 @@ name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
 # Amaç: aynı taban üzerine UART/earlycon debug config'lerini ekleyip
 # derleyerek, kernel başladıktan sonra UART'ın neden sessiz kaldığını görmek.
 #
-# EK (bu revizyon - v2): önceki revizyonda eklenen
-# CONFIG_SECURITY_SELINUX_BOOTPARAM=y / VALUE=0 YETERSİZ ÇIKTI.
-# UART log'u gösterdi ki: kernel gerçekten permissive (old_enforcing=0)
-# başlıyor, AMA init policy'yi yükledikten hemen sonra kendi
-# security_setenforce(1) çağrısını yapıp enforcing'e zorluyor
-# (log: "enforcing=1 old_enforcing=0" + "Init cannot set 'ro.boot.selinux'
-# to 'permissive': Read-only property was already set"). Bu, init
-# binary'sinin ALLOW_PERMISSIVE_SELINUX olmadan derlenmiş olmasından
-# kaynaklanıyor (OneUI/A35 prebuilt init, production/Knox sertleştirmesi)
-# - yani init kernel cmdline'daki androidboot.selinux=permissive'i
-# görmezden gelip her zaman enforcing'e geçmeye çalışıyor.
+# v2: CONFIG_SECURITY_SELINUX_BOOTPARAM tek başına yetersiz çıktı - init
+# kendi setenforce(1) çağrısını yapıp enforcing'e zorluyordu (OneUI/A35
+# prebuilt init, ALLOW_PERMISSIVE_SELINUX olmadan derlenmiş). Bunu
+# security/selinux/selinuxfs.c içindeki sel_write_enforce() fonksiyonunu
+# kaynak seviyesinde patch'leyerek çözdük: userspace ne yazarsa yazsın,
+# kernel gerçekte hep permissive kalıyor.
 #
-# Config bayrağı sadece "varsayılan başlangıç değerini" belirliyor,
-# userspace'in SONRADAN /sys/fs/selinux/enforce'a yazıp değiştirmesini
-# ENGELLEMİYOR. O yüzden artık security/selinux/selinuxfs.c içindeki
-# sel_write_enforce() fonksiyonunu KAYNAK SEVİYESİNDE patch'liyoruz:
-# userspace ne yazarsa yazsın (init'in setenforce(1) çağrısı dahil),
-# kernel bunu her zaman "0" (permissive) olarak işliyor. init "enforcing'e
-# geçtim" sanıyor ama kernel gerçekte hiç geçmiyor, AVC denied'lar hâlâ
-# loglanıyor (dmesg/audit'te görünmeye devam eder) ama artık hiçbiri
-# EACCES/abort() üretmiyor. Bu, netd'nin A35'ten kalma
-# "dumplog_data_file" (Samsung/OneUI-özel sepolicy etiketi, ginkgo'da
-# karşılığı yok) dizinine erişirken aldığı AVC denied yüzünden abort()
-# ile çöküp bootchecker'ın onu (ve zygote'u) sürekli restart ettiği
-# kısır döngüyü kırmak için.
+# v3 (bu revizyon): netbpfload/bpfloader/netd zinciri boot'u engelliyordu.
+# Kernel deposunu inceleyince (kernel/sys.c + init/main.c) şunu bulduk:
+# bu kernel ZATEN "uname_bpf_spoof" adında, Android'in BPF kernel-sürüm
+# kontrolünü atlatmak için tasarlanmış hazır bir mekanizma taşıyor.
+# İki ayrı ayar var:
+#   1) Kconfig seçimi (CONFIG_FAKE_UNAME_*): şu an defconfig'de 5.4
+#      seçili (trinket-perf_defconfig satır 64), ama Android 16 "25Q4"
+#      netbpfload build'i en az kernel 5.10 istiyor
+#      ("NetBpfLoad: Android 25Q4 requires kernel 5.10." - UART log'unda
+#      görüldü). Bu yüzden 5.4 yerine 5.10'u seçiyoruz (FAKE_UNAME_5_10
+#      -> sahte sürüm "5.10.239" bildirir, gerçek kernel değişmiyor).
+#   2) cmdline'daki "uname_bpf_spoof=" değeri: bootloader şu an "1"
+#      geçiyor, bu SADECE netbpfload process'i için spoof yapıyor
+#      (kernel/sys.c: bpf_spoof==1 -> partial mode). UART log'unda netd
+#      de hemen çöküyordu (~20ms'de exit status 1, sürekli tekrar) -
+#      kernel kaynağında "full mode" (1 dışındaki herhangi bir değer)
+#      netd ve uprobestats'ı da spoof kapsamına alıyor. Kernel'in kendi
+#      CONFIG_CMDLINE'ı CONFIG_CMDLINE_EXTEND=y sayesinde bootloader'ın
+#      cmdline'ının SONUNA ekleniyor, ve aynı parametre iki kez geçince
+#      kernel cmdline parser'ı SONUNCUSUNU kullanıyor - yani burada
+#      "uname_bpf_spoof=2" eklemek bootloader'ın "=1"ini override eder,
+#      DTB/bootloader tarafını ayrıca bulup değiştirmemize gerek kalmaz.
 #
-# Mevcut UART/earlycon/pstore/log debug ayarlarına dokunulmadı, önceki
-# config bloğu da (zararı olmadığı, ayrıca varsayılan durumu doğru
-# ayarladığı için) bırakıldı - asıl işi şimdi kaynak patch'i yapıyor.
+# Not: com.android.tethering.apex'i sistem build'inden çıkarmıştık
+# (bpfloader'ın reboot_on_failure'ını atlatmak için) - bu netd'yi BPF
+# programsız bıraktığı için netd crashloop'una ve Samsung bootchecker'ın
+# zorla reboot atmasına yol açtı. APEX'i geri eklemek gerekiyor; artık
+# amaç bpfloader'ın reboot atmadan GERÇEKTEN çalışıp BPF programlarını
+# yüklemesi (bu adım, kernel tarafında bunu mümkün kılıyor).
+#
+# Mevcut UART/earlycon/pstore/log debug ayarlarına ve SELinux patch
+# adımına dokunulmadı - sadece config fragmanına 4 yeni satır eklendi.
 
 on:
   workflow_dispatch:
@@ -90,6 +100,8 @@ jobs:
         working-directory: kernel
         run: |
           # Doğrulandı: gerçek defconfig fragmanı arch/arm64/configs/vendor/ginkgo.config
+          # (ckbuild.sh: DEFAULT_DEFCONFIG=vendor/trinket-perf_defconfig,
+          #  GINKGO_FRAGMENT=vendor/ginkgo.config üstüne merge ediliyor)
           DEFCONFIG_PATH="arch/arm64/configs/vendor/ginkgo.config"
           echo "Debug config eklenecek dosya: $DEFCONFIG_PATH"
 
@@ -127,11 +139,17 @@ jobs:
           CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0
           CONFIG_SECURITY_SELINUX_DEVELOP=y
 
-          CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive"
+          # ---- v3: netbpfload/netd BPF kernel-sürüm kontrolünü geçmek ----
+          # Base defconfig'de FAKE_UNAME_5_4 seçili, Android 16 "25Q4"
+          # netbpfload build'i >=5.10 istiyor - 5.10'a yükseltiyoruz.
+          # CONFIG_FAKE_UNAME_5_4 is not set
+          CONFIG_FAKE_UNAME_5_10=y
+
+          CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive uname_bpf_spoof=2"
           CONFIG_CMDLINE_EXTEND=y
           EOF
-          echo "Config eklendi, son 30 satır:"
-          tail -30 "$DEFCONFIG_PATH"
+          echo "Config eklendi, son 35 satır:"
+          tail -35 "$DEFCONFIG_PATH"
 
       # ASIL FİX BURADA: init'in setenforce(1) çağrısını kernel seviyesinde
       # etkisiz hale getiriyoruz. sel_write_enforce() /sys/fs/selinux/enforce
@@ -273,7 +291,7 @@ jobs:
 
             if [ -f ../AnyKernel3/anykernel.sh ]; then
               if grep -q "^cmdline=" ../AnyKernel3/anykernel.sh; then
-                sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive"|' ../AnyKernel3/anykernel.sh
+                sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive uname_bpf_spoof=2"|' ../AnyKernel3/anykernel.sh
               fi
             fi
 
