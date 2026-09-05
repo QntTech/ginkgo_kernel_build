@@ -2,10 +2,15 @@ name: Patch services.jar (disable VibratorManagerService.Lifecycle)
 
 # Kullanim:
 # 1) Bu dosyayi reponda .github/workflows/patch-services-jar.yml olarak kaydet.
-# 2) services.jar dosyasini repo kokune koy (ayni dizine, adiyla: services.jar).
+# 2) services.jar dosyani 7-Zip ile LZ4 sikistir (services.jar.lz4 olacak)
+#    ve repo kokune koy (25MB GitHub web-upload sinirini asmamak icin).
 # 3) GitHub'da Actions sekmesinden bu workflow'u "Run workflow" ile elle tetikle.
 # 4) Is bitince Actions calistirmasinin altindaki "Artifacts" bolumunden
 #    patched-services-jar.zip dosyasini indir, icinden services.jar'i cikar.
+#
+# Not: Eger dogrudan sikistirilmamis services.jar da repo kokunde varsa
+# (25MB alti kucuk bir jar test ediyorsan), workflow onu da kabul eder;
+# .lz4 dosyasi varsa oncelik ona verilir.
 
 on:
   workflow_dispatch: {}
@@ -23,13 +28,48 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: services.jar var mi kontrol et
+      - name: lz4 araclarini kur
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y lz4
+
+      - name: services.jar.lz4 var mi kontrol et ve ayikla
+        run: |
+          set -e
+          if [ -f services.jar.lz4 ]; then
+            echo "services.jar.lz4 bulundu, aciliyor..."
+            # 7-Zip'in urettigi .lz4 genelde ham LZ4 frame formatidir.
+            # Standart 'lz4' CLI araciyla acmayi dene.
+            if lz4 -d -f services.jar.lz4 services.jar 2>err.log; then
+              echo "lz4 ile basariyla acildi."
+            else
+              echo "UYARI: standart 'lz4 -d' basarisiz oldu, log:"
+              cat err.log
+              echo "Alternatif olarak 7z ile deneniyor..."
+              sudo apt-get install -y p7zip-full
+              7z x services.jar.lz4 -y
+              # 7z bazen .lz4 uzantisini kaldirip ayni isimli dosya uretir
+              if [ ! -f services.jar ]; then
+                # olusan dosyayi bul ve services.jar olarak adlandir
+                FOUND=$(find . -maxdepth 1 -newer services.jar.lz4 -name "services*" ! -name "*.lz4" | head -n1)
+                if [ -n "$FOUND" ]; then
+                  mv "$FOUND" services.jar
+                fi
+              fi
+            fi
+          elif [ -f services.jar ]; then
+            echo "services.jar.lz4 yok ama services.jar zaten mevcut, onu kullaniyorum."
+          else
+            echo "HATA: repo kokunde ne services.jar.lz4 ne de services.jar bulunamadi." >&2
+            exit 1
+          fi
+
           if [ ! -f services.jar ]; then
-            echo "HATA: repo kokunde services.jar bulunamadi." >&2
+            echo "HATA: services.jar acildiktan sonra da bulunamadi." >&2
             exit 1
           fi
           ls -la services.jar
+          file services.jar
 
       - name: smali/baksmali kaynagini klonla ve derle
         run: |
