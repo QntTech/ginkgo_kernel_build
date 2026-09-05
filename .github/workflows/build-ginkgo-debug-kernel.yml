@@ -16,7 +16,7 @@ name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
 # kaynak seviyesinde patch'leyerek çözdük: userspace ne yazarsa yazsın,
 # kernel gerçekte hep permissive kalıyor.
 #
-# v3 (bu revizyon): netbpfload/bpfloader/netd zinciri boot'u engelliyordu.
+# v3: netbpfload/bpfloader/netd zinciri boot'u engelliyordu.
 # Kernel deposunu inceleyince (kernel/sys.c + init/main.c) şunu bulduk:
 # bu kernel ZATEN "uname_bpf_spoof" adında, Android'in BPF kernel-sürüm
 # kontrolünü atlatmak için tasarlanmış hazır bir mekanizma taşıyor.
@@ -30,24 +30,35 @@ name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
 #   2) cmdline'daki "uname_bpf_spoof=" değeri: bootloader şu an "1"
 #      geçiyor, bu SADECE netbpfload process'i için spoof yapıyor
 #      (kernel/sys.c: bpf_spoof==1 -> partial mode). UART log'unda netd
-#      de hemen çöküyordu (~20ms'de exit status 1, sürekli tekrar) -
-#      kernel kaynağında "full mode" (1 dışındaki herhangi bir değer)
-#      netd ve uprobestats'ı da spoof kapsamına alıyor. Kernel'in kendi
-#      CONFIG_CMDLINE'ı CONFIG_CMDLINE_EXTEND=y sayesinde bootloader'ın
-#      cmdline'ının SONUNA ekleniyor, ve aynı parametre iki kez geçince
-#      kernel cmdline parser'ı SONUNCUSUNU kullanıyor - yani burada
-#      "uname_bpf_spoof=2" eklemek bootloader'ın "=1"ini override eder,
-#      DTB/bootloader tarafını ayrıca bulup değiştirmemize gerek kalmaz.
+#      de hemen çöküyordu - kernel kaynağında "full mode" (1 dışındaki
+#      herhangi bir değer) netd ve uprobestats'ı da spoof kapsamına alıyor.
+#
+# v4 (bu revizyon): v3'teki cmdline fix'i (uname_bpf_spoof=2) test edildi
+# ve İŞE YARAMADI - netd hâlâ "V+ platform with kernel version < 4.19.0
+# is unsupported" diyerek abort ediyordu (bkz. logcat: NetdUpdatable).
+# Sebep bulundu: CONFIG_CMDLINE_EXTEND=y ile kernel'in KENDİ CONFIG_CMDLINE'ı
+# ÖNCE, bootloader'ın (LK/ABL - bu build'in dışında, ayrı partition) kendi
+# varsayılan cmdline'ı SONRA ekleniyor. O varsayılan cmdline'da
+# "uname_bpf_spoof=1" zaten sabit geçiyor. Aynı parametre iki kez geçince
+# kernel'in parametre parser'ı SONUNCUSUNU kullanıyor - yani bizim "=2"
+# değerimiz her seferinde bootloader'ın "=1"i tarafından eziliyor.
+# Cmdline üzerinden çözülemeyecek bir sorun; bootloader'a dokunmadan
+# (DTB/LK tarafını değiştirmeden) çözmek için "bpf_spoof == 1" (partial
+# mode) karşılaştırmasını kaynak seviyesinde HİÇBİR ZAMAN doğru olamayacak
+# şekilde nötrlüyoruz - cmdline ne derse desin kod hep "full mode"a düşer.
+# Yöntem, sel_write_enforce patch'iyle aynı: userspace/bootloader'ın isteği
+# görmezden gelinir, kernel kendi kararını dayatır.
 #
 # Not: com.android.tethering.apex'i sistem build'inden çıkarmıştık
 # (bpfloader'ın reboot_on_failure'ını atlatmak için) - bu netd'yi BPF
 # programsız bıraktığı için netd crashloop'una ve Samsung bootchecker'ın
-# zorla reboot atmasına yol açtı. APEX'i geri eklemek gerekiyor; artık
-# amaç bpfloader'ın reboot atmadan GERÇEKTEN çalışıp BPF programlarını
-# yüklemesi (bu adım, kernel tarafında bunu mümkün kılıyor).
+# zorla reboot atmasına yol açtı. APEX geri eklendi (netbpfload artık
+# gerçekten çalışıp BPF programlarını yüklüyor); netd'nin şimdiki çöküşü
+# BPF eksikliğinden değil, bu yml'nin çözmeye çalıştığı kernel-sürüm
+# spoof sorunundan kaynaklanıyor.
 #
 # Mevcut UART/earlycon/pstore/log debug ayarlarına ve SELinux patch
-# adımına dokunulmadı - sadece config fragmanına 4 yeni satır eklendi.
+# adımına dokunulmadı.
 
 on:
   workflow_dispatch:
@@ -145,6 +156,11 @@ jobs:
           # CONFIG_FAKE_UNAME_5_4 is not set
           CONFIG_FAKE_UNAME_5_10=y
 
+          # NOT (v4): "uname_bpf_spoof=2" burada hâlâ duruyor ama tek
+          # başına ETKİSİZ - CONFIG_CMDLINE_EXTEND=y ile bootloader'ın
+          # kendi "uname_bpf_spoof=1"i bu değerin ÜZERİNE yazıyor (sonuncu
+          # değer kazanıyor). Asıl fix aşağıdaki yeni source-patch adımında.
+          # Zararı yok, kaldırmaya gerek de yok.
           CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive uname_bpf_spoof=2"
           CONFIG_CMDLINE_EXTEND=y
           EOF
@@ -241,6 +257,71 @@ jobs:
             exit 1
           fi
           echo "OK: new_value = 0; satır $NEWVAL_LINE, sscanf satır $SSCANF_LINE'den sonra - sıralama doğru."
+
+      # v4 - ASIL FİX BURADA: cmdline'dan "uname_bpf_spoof=2" göndermek işe
+      # yaramıyor çünkü CONFIG_CMDLINE_EXTEND=y modunda bootloader'ın kendi
+      # "uname_bpf_spoof=1"i bizimkinin ÜZERİNE yazıyor (sonuncu kazanıyor).
+      # Bootloader/DTB tarafına dokunmadan çözmek için "partial mode"u
+      # tetikleyen "bpf_spoof == 1" karşılaştırmasını kaynakta öyle bir
+      # patch'liyoruz ki ASLA doğru olamasın (& 0 eklenerek) - bootloader
+      # ne cmdline değeri gönderirse göndersin, kod hep "full mode"a düşer
+      # (netd ve uprobestats de spoof kapsamına girer).
+      #
+      # Önce iki dosyada da ("kernel/sys.c" ve "init/main.c" - v3'te bu
+      # ikisinde bulunmuştu) "bpf_spoof" geçen HER satırı basıyoruz ki
+      # otomatik patch beklenenden farklı bir kalıp bulursa (ör. "!= 2"
+      # ya da bitmask kontrolü gibi) bunu Actions log'unda görüp bana
+      # yapıştırabilesin - körlemesine yanlış bir patch atıp build'i
+      # sessizce bozmuyoruz, sel_write_enforce patch'indeki gibi net bir
+      # hata ile duruyoruz.
+      - name: Force uname_bpf_spoof full-mode regardless of cmdline value
+        working-directory: kernel
+        run: |
+          set -eu
+          echo "=== 'bpf_spoof' geçen tüm satırlar (kernel/sys.c + init/main.c) ==="
+          grep -n "bpf_spoof" kernel/sys.c 2>/dev/null || echo "(kernel/sys.c içinde yok)"
+          grep -n "bpf_spoof" init/main.c 2>/dev/null || echo "(init/main.c içinde yok)"
+
+          PATCHED=0
+          for f in kernel/sys.c init/main.c; do
+            [ -f "$f" ] || continue
+
+            if grep -q "BPF_SPOOF_ALWAYS_FULL_PATCH" "$f"; then
+              echo "$f zaten patch'lenmiş, atlıyorum."
+              PATCHED=1
+              continue
+            fi
+
+            # Değişken adı ne olursa olsun ("uname_bpf_spoof", "bpf_spoof" vs.)
+            # "bpf_spoof" içeren ve "== 1" ile karşılaştırma yapan satırı ara.
+            LINE=$(grep -n "bpf_spoof" "$f" | grep -E '==[[:space:]]*1\b' | head -1 | cut -d: -f1)
+            if [ -z "$LINE" ]; then
+              continue
+            fi
+
+            echo "=== $f satır $LINE (patch öncesi) ==="
+            sed -n "$((LINE>3?LINE-3:1)),$((LINE+3))p" "$f"
+
+            # "bpf_spoof<opsiyonel_ek> == 1"  ->  aynı ifade + " && 0" ekleyip
+            # karşılaştırmayı hiçbir zaman doğru olamayacak hale getiriyoruz.
+            sed -i -E "${LINE}s/([A-Za-z_]*bpf_spoof[A-Za-z_]*[[:space:]]*==[[:space:]]*1)\b/\\1 \&\& 0 \/* BPF_SPOOF_ALWAYS_FULL_PATCH *\//" "$f"
+
+            echo "=== $f satır $LINE (patch sonrası) ==="
+            sed -n "$((LINE>3?LINE-3:1)),$((LINE+3))p" "$f"
+
+            if ! grep -q "BPF_SPOOF_ALWAYS_FULL_PATCH" "$f"; then
+              echo "::error::$f satır $LINE'e patch eklenemedi (sed eşleşmedi)."
+              exit 1
+            fi
+            PATCHED=1
+          done
+
+          if [ "$PATCHED" -eq 0 ]; then
+            echo "::error::'bpf_spoof' + '== 1' kalıbı otomatik bulunamadı."
+            echo "::error::Yukarıdaki 'bpf_spoof geçen tüm satırlar' çıktısını kopyala,"
+            echo "::error::gerçek koda göre kesin patch'i yazacağız."
+            exit 1
+          fi
 
       - name: Run kernel's own build script
         working-directory: kernel
