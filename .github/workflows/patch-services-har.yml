@@ -1,0 +1,186 @@
+name: Patch services.jar (disable VibratorManagerService.Lifecycle)
+
+# Kullanim:
+# 1) Bu dosyayi reponda .github/workflows/patch-services-jar.yml olarak kaydet.
+# 2) services.jar dosyasini repo kokune koy (ayni dizine, adiyla: services.jar).
+# 3) GitHub'da Actions sekmesinden bu workflow'u "Run workflow" ile elle tetikle.
+# 4) Is bitince Actions calistirmasinin altindaki "Artifacts" bolumunden
+#    patched-services-jar.zip dosyasini indir, icinden services.jar'i cikar.
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo checkout
+        uses: actions/checkout@v4
+
+      - name: JDK kur
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: services.jar var mi kontrol et
+        run: |
+          if [ ! -f services.jar ]; then
+            echo "HATA: repo kokunde services.jar bulunamadi." >&2
+            exit 1
+          fi
+          ls -la services.jar
+
+      - name: smali/baksmali kaynagini klonla ve derle
+        run: |
+          git clone --depth 1 https://github.com/JesusFreke/smali.git smali-src
+          cd smali-src
+          chmod +x gradlew
+          ./gradlew :smali:fatJar :baksmali:fatJar --no-daemon
+          mkdir -p ../tools
+          find . -iname "smali-*-fat.jar" -exec cp {} ../tools/smali.jar \;
+          find . -iname "baksmali-*-fat.jar" -exec cp {} ../tools/baksmali.jar \;
+          cd ..
+          ls -la tools
+
+      - name: classes.dex cikar
+        run: |
+          mkdir -p work
+          cp services.jar work/services.jar
+          cd work
+          unzip -o services.jar -d extracted
+          ls extracted
+
+      - name: dex -> smali (baksmali)
+        run: |
+          cd work
+          java -jar ../tools/baksmali.jar disassemble \
+            extracted/classes.dex \
+            -o smali_out
+          echo "SystemServer.smali dosyasi araniyor..."
+          find smali_out -iname "SystemServer.smali"
+
+      - name: SystemServer.smali icinde VibratorManagerService cagrisini patchle
+        run: |
+          set -e
+          cd work
+          FILE=$(find smali_out -iname "SystemServer.smali" | head -n1)
+          if [ -z "$FILE" ]; then
+            echo "HATA: SystemServer.smali bulunamadi." >&2
+            exit 1
+          fi
+          echo "Bulunan dosya: $FILE"
+          cp "$FILE" "$FILE.bak"
+
+          python3 - "$FILE" << 'PYEOF'
+          import re, sys
+
+          path = sys.argv[1]
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          # VibratorManagerService$Lifecycle sinifini startService(...) ile
+          # baslatan cagriyi iceren blogu bul ve no-op yap (yorum satirina cevir).
+          #
+          # Smali'de sinif referansi genelde soyle gecer:
+          #   Lcom/android/server/vibrator/VibratorManagerService$Lifecycle;
+          # ve genelde su sekilde bir cagri paterni olur:
+          #   const-class vX, Lcom/android/server/vibrator/VibratorManagerService$Lifecycle;
+          #   invoke-virtual {vY, vX}, Lcom/android/server/SystemServiceManager;->startService(Ljava/lang/Class;)Lcom/android/server/SystemService;
+          #
+          # Once tam sinif adini tespit edelim (paket adi ROM'a gore degisebilir).
+          m = re.search(r'L[\w/$]*VibratorManagerService\$Lifecycle;', content)
+          if not m:
+              print("UYARI: VibratorManagerService$Lifecycle referansi bulunamadi. "
+                    "Manuel inceleme gerekebilir.")
+              sys.exit(0)
+
+          class_ref = m.group(0)
+          print(f"Bulunan sinif referansi: {class_ref}")
+
+          lines = content.split("\n")
+          out = []
+          i = 0
+          patched = False
+          while i < len(lines):
+              line = lines[i]
+              if class_ref in line and "const-class" in line:
+                  # const-class satirindan register'i al
+                  reg_match = re.search(r'const-class\s+(v\d+|p\d+),', line)
+                  target_reg = reg_match.group(1) if reg_match else None
+
+                  # Bu satirdan itibaren birkac satir ileriye bakip
+                  # startService cagrisini iceren invoke-* satirini bul.
+                  block_start = i
+                  block_end = i
+                  found_invoke = False
+                  j = i
+                  while j < min(i + 6, len(lines)):
+                      if "startService(" in lines[j] and "invoke-" in lines[j]:
+                          block_end = j
+                          found_invoke = True
+                          break
+                      j += 1
+
+                  if found_invoke:
+                      print(f"Patchleniyor: satir {block_start+1} - {block_end+1}")
+                      out.append(f"    # >>> PATCHED: VibratorManagerService.Lifecycle baslatma cagrisi devre disi birakildi")
+                      for k in range(block_start, block_end + 1):
+                          out.append(f"    # {lines[k]}")
+                      out.append(f"    # <<< PATCHED")
+                      i = block_end + 1
+                      patched = True
+                      continue
+
+              out.append(line)
+              i += 1
+
+          if not patched:
+              print("UYARI: startService cagrisi otomatik olarak eslesmedi. "
+                    "SystemServer.smali'yi elle incelemen gerekebilir "
+                    "(bak: SystemServer.smali.bak).")
+          else:
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write("\n".join(out))
+              print("Patch basariyla uygulandi.")
+          PYEOF
+
+          echo "----- Degisiklik ozeti (diff) -----"
+          diff "$FILE.bak" "$FILE" || true
+
+          echo "----- VibratorManagerService gecen tum satirlar (kontrol icin) -----"
+          grep -n "VibratorManagerService" "$FILE.bak" || echo "(hic gecmiyor - class adi farkli olabilir)"
+
+      - name: smali -> dex (smali assemble)
+        run: |
+          cd work
+          java -jar ../tools/smali.jar assemble smali_out -o classes_patched.dex
+          ls -la classes_patched.dex
+
+      - name: Yeni classes.dex ile services.jar'i yeniden paketle
+        run: |
+          cd work
+          cp classes_patched.dex extracted/classes.dex
+          cd extracted
+          zip -r -X ../services_patched.jar . -x ".*"
+          cd ..
+          ls -la services_patched.jar
+
+      - name: Patchlenmis jar'i ve smali diff'ini artifact olarak yukle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-services-jar
+          path: |
+            work/services_patched.jar
+            work/smali_out/**/SystemServer.smali
+            work/smali_out/**/SystemServer.smali.bak
+          if-no-files-found: warn
+
+      - name: Sadece SystemServer.smali'yi ayrica yukle (patch otomatik tutmazsa manuel bakman icin)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SystemServer-smali-raw
+          path: work/smali_out/**/SystemServer.smali*
+          if-no-files-found: warn
