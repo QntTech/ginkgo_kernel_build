@@ -22,12 +22,6 @@ jobs:
       - name: Repo checkout
         uses: actions/checkout@v4
 
-      - name: JDK kur
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-
       - name: lz4 araclarini kur
         run: |
           sudo apt-get update -y
@@ -71,17 +65,34 @@ jobs:
           ls -la services.jar
           file services.jar
 
-      - name: smali/baksmali kaynagini klonla ve derle
+      - name: JDK 11 kur (smali'nin resmi build gereksinimi budur - Gradle 6.8.2, JDK 12+ desteklemez)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: JAVA_HOME dogru ayarlandi mi dogrula
         run: |
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          "$JAVA_HOME/bin/java" -version
+
+      - name: smali/baksmali kaynagini klonla ve derle (JDK 11 ile)
+        run: |
+          set -e
+          git clone --depth 1 --branch v2.5.2 https://github.com/JesusFreke/smali.git smali-src || \
           git clone --depth 1 https://github.com/JesusFreke/smali.git smali-src
           cd smali-src
           chmod +x gradlew
-          ./gradlew :smali:fatJar :baksmali:fatJar --no-daemon
+          echo "Kullanilan Java: $JAVA_HOME"
+          "$JAVA_HOME/bin/java" -version
+          ./gradlew :smali:fatJar :baksmali:fatJar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME"
           mkdir -p ../tools
           find . -iname "smali-*-fat.jar" -exec cp {} ../tools/smali.jar \;
           find . -iname "baksmali-*-fat.jar" -exec cp {} ../tools/baksmali.jar \;
           cd ..
           ls -la tools
+          file tools/*.jar
 
       - name: classes.dex cikar
         run: |
