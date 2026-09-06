@@ -1,5 +1,4 @@
 name: Patch services.jar (disable VibratorManagerService.Lifecycle)
-
 # Kullanim:
 # 1) Bu dosyayi reponda .github/workflows/patch-services-jar.yml olarak kaydet.
 # 2) services.jar dosyani 7-Zip ile LZ4 sikistir (services.jar.lz4 olacak)
@@ -11,10 +10,20 @@ name: Patch services.jar (disable VibratorManagerService.Lifecycle)
 # Not: Eger dogrudan sikistirilmamis services.jar da repo kokunde varsa
 # (25MB alti kucuk bir jar test ediyorsan), workflow onu da kabul eder;
 # .lz4 dosyasi varsa oncelik ona verilir.
-
+#
+# DEGISIKLIK GECMISI:
+# - smali/baksmali artik kaynaktan derlenmiyor; JesusFreke/smali v2.5.2
+#   yeni Android surumlerinin urettigi dex formatlarini (ornegin dex 041)
+#   TANIMIYOR ve "Dex version 041 is not supported" hatasi veriyordu.
+#   Bunun yerine, bu projeyi surduren google/smali fork'unun (com.android.tools.smali)
+#   guncel, onceden derlenmis fat-jar'lari (v3.0.9) doğrudan indiriliyor.
+#   Bu jarlar guncel dex surumlerini destekler ve CLI komutlari
+#   (disassemble/assemble) ayni kaldigi icin workflow'un geri kalani degismedi.
+# - services.jar multidex olabilecegi (classes.dex, classes2.dex, classes3.dex...)
+#   icin artik TUM dex dosyalari taraniyor, SystemServer.smali hangisinde
+#   bulunursa SADECE o dex patchlenip geri paketleniyor.
 on:
   workflow_dispatch: {}
-
 jobs:
   patch:
     runs-on: ubuntu-latest
@@ -44,7 +53,6 @@ jobs:
               7z x services.jar.lz4 -y
               # 7z bazen .lz4 uzantisini kaldirip ayni isimli dosya uretir
               if [ ! -f services.jar ]; then
-                # olusan dosyayi bul ve services.jar olarak adlandir
                 FOUND=$(find . -maxdepth 1 -newer services.jar.lz4 -name "services*" ! -name "*.lz4" | head -n1)
                 if [ -n "$FOUND" ]; then
                   mv "$FOUND" services.jar
@@ -57,7 +65,6 @@ jobs:
             echo "HATA: repo kokunde ne services.jar.lz4 ne de services.jar bulunamadi." >&2
             exit 1
           fi
-
           if [ ! -f services.jar ]; then
             echo "HATA: services.jar acildiktan sonra da bulunamadi." >&2
             exit 1
@@ -65,165 +72,81 @@ jobs:
           ls -la services.jar
           file services.jar
 
-      - name: JDK 11 kur (smali'nin resmi build gereksinimi budur - Gradle 6.8.2, JDK 12+ desteklemez)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '11'
-
-      - name: JAVA_HOME dogru ayarlandi mi dogrula
-        run: |
-          echo "JAVA_HOME=$JAVA_HOME"
-          java -version
-          "$JAVA_HOME/bin/java" -version
-
-      - name: smali/baksmali kaynagini klonla ve derle (JDK 11 ile)
+      - name: smali/baksmali hazir jarlarini indir (v3.0.9 - guncel dex surumlerini destekler)
         run: |
           set -e
-          git clone --depth 1 --branch v2.5.2 https://github.com/JesusFreke/smali.git smali-src || \
-          git clone --depth 1 https://github.com/JesusFreke/smali.git smali-src
-          cd smali-src
-          chmod +x gradlew
-          echo "Kullanilan Java: $JAVA_HOME"
-          "$JAVA_HOME/bin/java" -version
-
-          # Gradle'in proje-ici jar bagimliliklarini (util -> baksmali/smali)
-          # bazen dogru sirada/wiring ile calistirmadigi goruldu
-          # ("util-x.jar does not exist" hatasi tekrar tekrar cikti).
-          # Bu yuzden gradle'a guvenmek yerine: her alt projeyi TEK TEK,
-          # ayri gradle cagrilariyla, sirayla derliyoruz. Her cagri kendi
-          # bagimliliklarini (asagi dogru) otomatik derler ama biz yine de
-          # asagidan yukariya elle sirayla tetikleyerek belirsizligi sifirliyoruz.
-          echo "===== 1/4: util derleniyor ====="
-          ./gradlew :util:jar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME"
-          find util/build/libs -name "*.jar" -exec ls -la {} \;
-
-          echo "===== 2/4: dexlib2 derleniyor ====="
-          ./gradlew :dexlib2:jar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME"
-          find dexlib2/build/libs -name "*.jar" -exec ls -la {} \;
-
-          echo "===== 3/4: smali fatJar deneniyor ====="
-          ./gradlew :smali:fatJar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" || SMALI_FAILED=1
-
-          echo "===== 4/4: baksmali fatJar deneniyor ====="
-          ./gradlew :baksmali:fatJar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" || BAKSMALI_FAILED=1
-
-          mkdir -p ../tools
-
-          # Gradle'in fatJar'i basarisiz olursa (util jar'ini classpath'e
-          # dogru koymamasi durumu), fat jar'i KENDIMIZ elle olustururuz:
-          # util + dexlib2 + smali/baksmali'nin derlenmis class dosyalarini
-          # ve gerekli 3.parti bagimlilik jar'larini (guava, jcommander, antlr
-          # runtime, stringtemplate) tek bir jar'da birlestiririz.
-          if [ -n "${SMALI_FAILED:-}" ] || [ -n "${BAKSMALI_FAILED:-}" ]; then
-            echo "===== Gradle fatJar basarisiz oldu, manuel fat-jar olusturuluyor ====="
-
-            # Gradle cache'inden bagimlilik jar'larini bul
-            GRADLE_CACHE=$(find ${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2 -iname "guava-*.jar" ! -iname "*sources*" ! -iname "*javadoc*" | head -n1)
-            echo "Bulunan guava: $GRADLE_CACHE"
-
-            mkdir -p manual_fat/smali manual_fat/baksmali
-
-            # SMALI icin manuel fat jar
-            cd manual_fat/smali
-            cp -r ../../util/build/classes/java/main/* . 2>/dev/null || true
-            cp -r ../../dexlib2/build/classes/java/main/* . 2>/dev/null || true
-            cp -r ../../smali/build/classes/java/main/* . 2>/dev/null || true
-            for depjar in $(find ${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2 -iname "*.jar" \
-                \( -iname "guava-*" -o -iname "jcommander-*" -o -iname "antlr-runtime-*" -o -iname "stringtemplate-*" \) \
-                ! -iname "*sources*" ! -iname "*javadoc*"); do
-              unzip -oq "$depjar" -d . -x "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" 2>/dev/null || true
-            done
-            echo "Main-Class: org.jf.smali.Main" > ../smali-manifest.txt
-            echo "" >> ../smali-manifest.txt
-            jar cfm ../../../tools/smali.jar ../smali-manifest.txt -C . .
-            cd ../../..
-
-            # BAKSMALI icin manuel fat jar
-            cd manual_fat/baksmali
-            cp -r ../../util/build/classes/java/main/* . 2>/dev/null || true
-            cp -r ../../dexlib2/build/classes/java/main/* . 2>/dev/null || true
-            cp -r ../../baksmali/build/classes/java/main/* . 2>/dev/null || true
-            for depjar in $(find ${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2 -iname "*.jar" \
-                \( -iname "guava-*" -o -iname "jcommander-*" \) \
-                ! -iname "*sources*" ! -iname "*javadoc*"); do
-              unzip -oq "$depjar" -d . -x "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" 2>/dev/null || true
-            done
-            echo "Main-Class: org.jf.baksmali.Main" > ../baksmali-manifest.txt
-            echo "" >> ../baksmali-manifest.txt
-            jar cfm ../../../tools/baksmali.jar ../baksmali-manifest.txt -C . .
-            cd ../../..
-          else
-            SMALI_JAR=$(find smali/build/libs -iname "smali-*-fat.jar" | head -n1)
-            BAKSMALI_JAR=$(find baksmali/build/libs -iname "baksmali-*-fat.jar" | head -n1)
-            cp "$SMALI_JAR" ../tools/smali.jar
-            cp "$BAKSMALI_JAR" ../tools/baksmali.jar
-          fi
-
-          cd ..
+          mkdir -p tools
+          SMALI_VER="3.0.9"
+          BASE_URL="https://github.com/baksmali/smali/releases/download/${SMALI_VER}"
+          curl -fL -o tools/baksmali.jar "${BASE_URL}/baksmali-${SMALI_VER}-fat.jar"
+          curl -fL -o tools/smali.jar "${BASE_URL}/smali-${SMALI_VER}-fat.jar"
           echo "----- Sonuc -----"
           ls -la tools
           file tools/*.jar
-
           echo "----- Hizli fonksiyon testi -----"
-          java -jar tools/baksmali.jar --help 2>&1 | head -5
-          java -jar tools/smali.jar --help 2>&1 | head -5
+          java -jar tools/baksmali.jar --version
+          java -jar tools/smali.jar --version
 
-      - name: classes.dex cikar
+      - name: classes*.dex cikar (multidex destekli)
         run: |
+          set -e
           mkdir -p work
           cp services.jar work/services.jar
           cd work
           unzip -o services.jar -d extracted
-          ls extracted
+          echo "----- Bulunan dex dosyalari -----"
+          find extracted -maxdepth 1 -iname "classes*.dex" | sort
 
-      - name: dex -> smali (baksmali)
+      - name: Her dex icin baksmali calistir (SystemServer.smali'yi bul)
         run: |
+          set -e
           cd work
-          java -jar ../tools/baksmali.jar disassemble \
-            extracted/classes.dex \
-            -o smali_out
-          echo "SystemServer.smali dosyasi araniyor..."
-          find smali_out -iname "SystemServer.smali"
+          mkdir -p smali_out
+          FOUND_DEX=""
+          for dexfile in extracted/classes*.dex; do
+            [ -e "$dexfile" ] || continue
+            base=$(basename "$dexfile" .dex)
+            outdir="smali_out/$base"
+            echo "===== Disassemble: $dexfile -> $outdir ====="
+            java -jar ../tools/baksmali.jar disassemble "$dexfile" -o "$outdir"
+            if find "$outdir" -iname "SystemServer.smali" | grep -q .; then
+              echo "SystemServer.smali bulundu: $dexfile"
+              FOUND_DEX="$base"
+            fi
+          done
+          if [ -z "$FOUND_DEX" ]; then
+            echo "HATA: SystemServer.smali hicbir dex'te bulunamadi." >&2
+            exit 1
+          fi
+          echo "$FOUND_DEX" > found_dex.txt
+          echo "Patchlenecek dex: $FOUND_DEX"
 
       - name: SystemServer.smali icinde VibratorManagerService cagrisini patchle
         run: |
           set -e
           cd work
-          FILE=$(find smali_out -iname "SystemServer.smali" | head -n1)
+          FOUND_DEX=$(cat found_dex.txt)
+          FILE=$(find "smali_out/$FOUND_DEX" -iname "SystemServer.smali" | head -n1)
           if [ -z "$FILE" ]; then
             echo "HATA: SystemServer.smali bulunamadi." >&2
             exit 1
           fi
           echo "Bulunan dosya: $FILE"
           cp "$FILE" "$FILE.bak"
-
           python3 - "$FILE" << 'PYEOF'
           import re, sys
-
           path = sys.argv[1]
           with open(path, "r", encoding="utf-8") as f:
               content = f.read()
-
           # VibratorManagerService$Lifecycle sinifini startService(...) ile
           # baslatan cagriyi iceren blogu bul ve no-op yap (yorum satirina cevir).
-          #
-          # Smali'de sinif referansi genelde soyle gecer:
-          #   Lcom/android/server/vibrator/VibratorManagerService$Lifecycle;
-          # ve genelde su sekilde bir cagri paterni olur:
-          #   const-class vX, Lcom/android/server/vibrator/VibratorManagerService$Lifecycle;
-          #   invoke-virtual {vY, vX}, Lcom/android/server/SystemServiceManager;->startService(Ljava/lang/Class;)Lcom/android/server/SystemService;
-          #
-          # Once tam sinif adini tespit edelim (paket adi ROM'a gore degisebilir).
           m = re.search(r'L[\w/$]*VibratorManagerService\$Lifecycle;', content)
           if not m:
               print("UYARI: VibratorManagerService$Lifecycle referansi bulunamadi. "
                     "Manuel inceleme gerekebilir.")
               sys.exit(0)
-
           class_ref = m.group(0)
           print(f"Bulunan sinif referansi: {class_ref}")
-
           lines = content.split("\n")
           out = []
           i = 0
@@ -231,12 +154,8 @@ jobs:
           while i < len(lines):
               line = lines[i]
               if class_ref in line and "const-class" in line:
-                  # const-class satirindan register'i al
                   reg_match = re.search(r'const-class\s+(v\d+|p\d+),', line)
                   target_reg = reg_match.group(1) if reg_match else None
-
-                  # Bu satirdan itibaren birkac satir ileriye bakip
-                  # startService cagrisini iceren invoke-* satirini bul.
                   block_start = i
                   block_end = i
                   found_invoke = False
@@ -247,7 +166,6 @@ jobs:
                           found_invoke = True
                           break
                       j += 1
-
                   if found_invoke:
                       print(f"Patchleniyor: satir {block_start+1} - {block_end+1}")
                       out.append(f"    # >>> PATCHED: VibratorManagerService.Lifecycle baslatma cagrisi devre disi birakildi")
@@ -257,10 +175,8 @@ jobs:
                       i = block_end + 1
                       patched = True
                       continue
-
               out.append(line)
               i += 1
-
           if not patched:
               print("UYARI: startService cagrisi otomatik olarak eslesmedi. "
                     "SystemServer.smali'yi elle incelemen gerekebilir "
@@ -270,23 +186,22 @@ jobs:
                   f.write("\n".join(out))
               print("Patch basariyla uygulandi.")
           PYEOF
-
           echo "----- Degisiklik ozeti (diff) -----"
           diff "$FILE.bak" "$FILE" || true
-
           echo "----- VibratorManagerService gecen tum satirlar (kontrol icin) -----"
           grep -n "VibratorManagerService" "$FILE.bak" || echo "(hic gecmiyor - class adi farkli olabilir)"
 
-      - name: smali -> dex (smali assemble)
+      - name: Sadece patchlenen dex'i smali ile yeniden derle
         run: |
+          set -e
           cd work
-          java -jar ../tools/smali.jar assemble smali_out -o classes_patched.dex
-          ls -la classes_patched.dex
+          FOUND_DEX=$(cat found_dex.txt)
+          java -jar ../tools/smali.jar assemble "smali_out/$FOUND_DEX" -o "extracted/${FOUND_DEX}.dex"
+          ls -la "extracted/${FOUND_DEX}.dex"
 
-      - name: Yeni classes.dex ile services.jar'i yeniden paketle
+      - name: Patchlenmis dex ile services.jar'i yeniden paketle
         run: |
           cd work
-          cp classes_patched.dex extracted/classes.dex
           cd extracted
           zip -r -X ../services_patched.jar . -x ".*"
           cd ..
