@@ -86,13 +86,88 @@ jobs:
           chmod +x gradlew
           echo "Kullanilan Java: $JAVA_HOME"
           "$JAVA_HOME/bin/java" -version
-          ./gradlew :smali:fatJar :baksmali:fatJar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME"
+
+          # Gradle'in proje-ici jar bagimliliklarini (util -> baksmali/smali)
+          # bazen dogru sirada/wiring ile calistirmadigi goruldu
+          # ("util-x.jar does not exist" hatasi tekrar tekrar cikti).
+          # Bu yuzden gradle'a guvenmek yerine: her alt projeyi TEK TEK,
+          # ayri gradle cagrilariyla, sirayla derliyoruz. Her cagri kendi
+          # bagimliliklarini (asagi dogru) otomatik derler ama biz yine de
+          # asagidan yukariya elle sirayla tetikleyerek belirsizligi sifirliyoruz.
+          echo "===== 1/4: util derleniyor ====="
+          ./gradlew :util:jar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME"
+          find util/build/libs -name "*.jar" -exec ls -la {} \;
+
+          echo "===== 2/4: dexlib2 derleniyor ====="
+          ./gradlew :dexlib2:jar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME"
+          find dexlib2/build/libs -name "*.jar" -exec ls -la {} \;
+
+          echo "===== 3/4: smali fatJar deneniyor ====="
+          ./gradlew :smali:fatJar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" || SMALI_FAILED=1
+
+          echo "===== 4/4: baksmali fatJar deneniyor ====="
+          ./gradlew :baksmali:fatJar --no-daemon -Dorg.gradle.java.home="$JAVA_HOME" || BAKSMALI_FAILED=1
+
           mkdir -p ../tools
-          find . -iname "smali-*-fat.jar" -exec cp {} ../tools/smali.jar \;
-          find . -iname "baksmali-*-fat.jar" -exec cp {} ../tools/baksmali.jar \;
+
+          # Gradle'in fatJar'i basarisiz olursa (util jar'ini classpath'e
+          # dogru koymamasi durumu), fat jar'i KENDIMIZ elle olustururuz:
+          # util + dexlib2 + smali/baksmali'nin derlenmis class dosyalarini
+          # ve gerekli 3.parti bagimlilik jar'larini (guava, jcommander, antlr
+          # runtime, stringtemplate) tek bir jar'da birlestiririz.
+          if [ -n "${SMALI_FAILED:-}" ] || [ -n "${BAKSMALI_FAILED:-}" ]; then
+            echo "===== Gradle fatJar basarisiz oldu, manuel fat-jar olusturuluyor ====="
+
+            # Gradle cache'inden bagimlilik jar'larini bul
+            GRADLE_CACHE=$(find ${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2 -iname "guava-*.jar" ! -iname "*sources*" ! -iname "*javadoc*" | head -n1)
+            echo "Bulunan guava: $GRADLE_CACHE"
+
+            mkdir -p manual_fat/smali manual_fat/baksmali
+
+            # SMALI icin manuel fat jar
+            cd manual_fat/smali
+            cp -r ../../util/build/classes/java/main/* . 2>/dev/null || true
+            cp -r ../../dexlib2/build/classes/java/main/* . 2>/dev/null || true
+            cp -r ../../smali/build/classes/java/main/* . 2>/dev/null || true
+            for depjar in $(find ${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2 -iname "*.jar" \
+                \( -iname "guava-*" -o -iname "jcommander-*" -o -iname "antlr-runtime-*" -o -iname "stringtemplate-*" \) \
+                ! -iname "*sources*" ! -iname "*javadoc*"); do
+              unzip -oq "$depjar" -d . -x "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" 2>/dev/null || true
+            done
+            echo "Main-Class: org.jf.smali.Main" > ../smali-manifest.txt
+            echo "" >> ../smali-manifest.txt
+            jar cfm ../../../tools/smali.jar ../smali-manifest.txt -C . .
+            cd ../../..
+
+            # BAKSMALI icin manuel fat jar
+            cd manual_fat/baksmali
+            cp -r ../../util/build/classes/java/main/* . 2>/dev/null || true
+            cp -r ../../dexlib2/build/classes/java/main/* . 2>/dev/null || true
+            cp -r ../../baksmali/build/classes/java/main/* . 2>/dev/null || true
+            for depjar in $(find ${GRADLE_USER_HOME:-$HOME/.gradle}/caches/modules-2 -iname "*.jar" \
+                \( -iname "guava-*" -o -iname "jcommander-*" \) \
+                ! -iname "*sources*" ! -iname "*javadoc*"); do
+              unzip -oq "$depjar" -d . -x "META-INF/*.SF" "META-INF/*.RSA" "META-INF/*.DSA" 2>/dev/null || true
+            done
+            echo "Main-Class: org.jf.baksmali.Main" > ../baksmali-manifest.txt
+            echo "" >> ../baksmali-manifest.txt
+            jar cfm ../../../tools/baksmali.jar ../baksmali-manifest.txt -C . .
+            cd ../../..
+          else
+            SMALI_JAR=$(find smali/build/libs -iname "smali-*-fat.jar" | head -n1)
+            BAKSMALI_JAR=$(find baksmali/build/libs -iname "baksmali-*-fat.jar" | head -n1)
+            cp "$SMALI_JAR" ../tools/smali.jar
+            cp "$BAKSMALI_JAR" ../tools/baksmali.jar
+          fi
+
           cd ..
+          echo "----- Sonuc -----"
           ls -la tools
           file tools/*.jar
+
+          echo "----- Hizli fonksiyon testi -----"
+          java -jar tools/baksmali.jar --help 2>&1 | head -5
+          java -jar tools/smali.jar --help 2>&1 | head -5
 
       - name: classes.dex cikar
         run: |
