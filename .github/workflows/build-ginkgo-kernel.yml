@@ -1,4 +1,4 @@
-name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
+name: Build Ginkgo Kernel (Floppy base, prod - debug removed)
 
 # Elindeki çalışan kernel Floppy Kernel (flopster101), kaynağı:
 #   https://github.com/FlopKernel-Series/flop_trinket-mi_kernel  (branch: floppy-unity)
@@ -6,59 +6,52 @@ name: Build Ginkgo Debug Kernel (Floppy base, UART/OneUI bring-up)
 # Kendi make komutlarımızı tahmin etmek yerine BU script'i çalıştırıyoruz,
 # çünkü doğru defconfig/toolchain/flag seçimini zaten biliyor.
 #
-# Amaç: aynı taban üzerine UART/earlycon debug config'lerini ekleyip
-# derleyerek, kernel başladıktan sonra UART'ın neden sessiz kaldığını görmek.
+# ============================================================================
+# v5 (bu revizyon): DEBUG BRING-UP KALDIRILDI
+# ============================================================================
+# v1-v4'te eklenen UART/earlycon debug bloğu artık gereksiz (UART sorunu
+# çözüldü) ve gerçek performans maliyeti var. Kaynak deposu (trinket-perf_
+# defconfig) incelendi; base'te zaten şunlar açık/kapalı geliyor:
+#   - CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y, ThinLTO açık
+#   - CONFIG_SLUB_DEBUG / KASAN / SCHEDSTATS / DETECT_HUNG_TASK / lock-debug: kapalı
+#   - CONFIG_SERIAL_MSM_GENI_CONSOLE / SERIAL_EARLYCON / EARLY_PRINTK: kapalı
+#   - CONFIG_DYNAMIC_DEBUG: kapalı, CONFIG_LOG_BUF_SHIFT=20, LOGLEVEL_DEFAULT=7
+#   - CONFIG_PANIC_TIMEOUT=2 (gerçek bir panic'te 2sn sonra reboot atar)
+# Yani base defconfig zaten performans için ayarlanmış durumda; bizim v1'de
+# eklediğimiz debug bloğu bunun ÜZERİNE ekstra maliyet bindiriyordu:
+#   - Konsolu UART'a açmak (SERIAL_MSM_GENI_CONSOLE/EARLYCON/EARLY_PRINTK)
+#     + "ignore_loglevel debug initcall_debug" cmdline flag'leri: her kernel
+#     mesajını 115200 baud seri porta senkron yazdırıyordu (asıl boot
+#     yavaşlamasının kaynağı muhtemelen bu).
+#   - LOG_BUF_SHIFT 20->21, CONSOLE_LOGLEVEL_DEFAULT 7->15,
+#     MESSAGE_LOGLEVEL_DEFAULT 4->7, DYNAMIC_DEBUG açılması: ekstra log
+#     üretimi + bellek.
+#   - PANIC_TIMEOUT 2->0, PANIC_ON_OOPS zorla kapatılması, HARDLOCKUP/
+#     SOFTLOCKUP_PANIC=n: bring-up sırasında "panic olunca dursun,
+#     incelensin" içindi - üretimde tam tersi istenir (gerçek bir panic'te
+#     cihaz kendini toplayıp reboot atmalı), bu yüzden kaldırıldı.
 #
-# v2: CONFIG_SECURITY_SELINUX_BOOTPARAM tek başına yetersiz çıktı - init
-# kendi setenforce(1) çağrısını yapıp enforcing'e zorluyordu (OneUI/A35
-# prebuilt init, ALLOW_PERMISSIVE_SELINUX olmadan derlenmiş). Bunu
-# security/selinux/selinuxfs.c içindeki sel_write_enforce() fonksiyonunu
-# kaynak seviyesinde patch'leyerek çözdük: userspace ne yazarsa yazsın,
-# kernel gerçekte hep permissive kalıyor.
+# BONUS FIX: v1-v4'teki CONFIG_CMDLINE tamamen string override yaptığı için
+# base defconfig'in "cgroup_disable=pressure" parametresini (PSI accounting
+# maliyetini azaltan gerçek bir optimizasyon) sessizce siliyordu. v5'te geri
+# eklendi.
 #
-# v3: netbpfload/bpfloader/netd zinciri boot'u engelliyordu.
-# Kernel deposunu inceleyince (kernel/sys.c + init/main.c) şunu bulduk:
-# bu kernel ZATEN "uname_bpf_spoof" adında, Android'in BPF kernel-sürüm
-# kontrolünü atlatmak için tasarlanmış hazır bir mekanizma taşıyor.
-# İki ayrı ayar var:
-#   1) Kconfig seçimi (CONFIG_FAKE_UNAME_*): şu an defconfig'de 5.4
-#      seçili (trinket-perf_defconfig satır 64), ama Android 16 "25Q4"
-#      netbpfload build'i en az kernel 5.10 istiyor
-#      ("NetBpfLoad: Android 25Q4 requires kernel 5.10." - UART log'unda
-#      görüldü). Bu yüzden 5.4 yerine 5.10'u seçiyoruz (FAKE_UNAME_5_10
-#      -> sahte sürüm "5.10.239" bildirir, gerçek kernel değişmiyor).
-#   2) cmdline'daki "uname_bpf_spoof=" değeri: bootloader şu an "1"
-#      geçiyor, bu SADECE netbpfload process'i için spoof yapıyor
-#      (kernel/sys.c: bpf_spoof==1 -> partial mode). UART log'unda netd
-#      de hemen çöküyordu - kernel kaynağında "full mode" (1 dışındaki
-#      herhangi bir değer) netd ve uprobestats'ı da spoof kapsamına alıyor.
+# KORUNANLAR (debug değil, işlevsel fix - dokunulmadı):
+#   - CONFIG_SECURITY_SELINUX_BOOTPARAM=y + VALUE=0: başlangıç durumu permissive.
+#   - sel_write_enforce() source patch: init'in setenforce(1) çağrısını
+#     etkisiz kılıyor (OneUI/A35 prebuilt init enforcing'e zorluyordu).
+#   - CONFIG_FAKE_UNAME_5_10=y: netbpfload'un ">=5.10" kernel şartını geçmek için.
+#   - bpf_spoof "== 1" karşılaştırmasını kaynakta nötrleyen patch: cmdline'daki
+#     uname_bpf_spoof=2 değerini bootloader'ın sabit "=1"i eziyordu (aynı
+#     parametre iki kez geçince kernel sonuncusunu kullanıyor), bu yüzden
+#     "partial mode"u tetikleyen karşılaştırma kaynakta hep yanlış olacak
+#     şekilde patch'lendi -> her zaman "full mode" (netd + uprobestats dahil).
+#   - com.android.tethering.apex sistemde kalmaya devam ediyor (netbpfload
+#     BPF programlarını gerçekten yüklesin diye, netd crashloop'unu önlemek için).
 #
-# v4 (bu revizyon): v3'teki cmdline fix'i (uname_bpf_spoof=2) test edildi
-# ve İŞE YARAMADI - netd hâlâ "V+ platform with kernel version < 4.19.0
-# is unsupported" diyerek abort ediyordu (bkz. logcat: NetdUpdatable).
-# Sebep bulundu: CONFIG_CMDLINE_EXTEND=y ile kernel'in KENDİ CONFIG_CMDLINE'ı
-# ÖNCE, bootloader'ın (LK/ABL - bu build'in dışında, ayrı partition) kendi
-# varsayılan cmdline'ı SONRA ekleniyor. O varsayılan cmdline'da
-# "uname_bpf_spoof=1" zaten sabit geçiyor. Aynı parametre iki kez geçince
-# kernel'in parametre parser'ı SONUNCUSUNU kullanıyor - yani bizim "=2"
-# değerimiz her seferinde bootloader'ın "=1"i tarafından eziliyor.
-# Cmdline üzerinden çözülemeyecek bir sorun; bootloader'a dokunmadan
-# (DTB/LK tarafını değiştirmeden) çözmek için "bpf_spoof == 1" (partial
-# mode) karşılaştırmasını kaynak seviyesinde HİÇBİR ZAMAN doğru olamayacak
-# şekilde nötrlüyoruz - cmdline ne derse desin kod hep "full mode"a düşer.
-# Yöntem, sel_write_enforce patch'iyle aynı: userspace/bootloader'ın isteği
-# görmezden gelinir, kernel kendi kararını dayatır.
-#
-# Not: com.android.tethering.apex'i sistem build'inden çıkarmıştık
-# (bpfloader'ın reboot_on_failure'ını atlatmak için) - bu netd'yi BPF
-# programsız bıraktığı için netd crashloop'una ve Samsung bootchecker'ın
-# zorla reboot atmasına yol açtı. APEX geri eklendi (netbpfload artık
-# gerçekten çalışıp BPF programlarını yüklüyor); netd'nin şimdiki çöküşü
-# BPF eksikliğinden değil, bu yml'nin çözmeye çalıştığı kernel-sürüm
-# spoof sorunundan kaynaklanıyor.
-#
-# Mevcut UART/earlycon/pstore/log debug ayarlarına ve SELinux patch
-# adımına dokunulmadı.
+# Mevcut sonuç: kernel işlevsel olarak v4 ile birebir aynı davranıyor
+# (SELinux permissive + tam bpf spoof), sadece debug/log/console overhead'i
+# kaldırılmış oldu.
 
 on:
   workflow_dispatch:
@@ -104,76 +97,49 @@ jobs:
           cat do_build.sh || echo "do_build.sh bulunamadı, dosya listesi:"
           ls -la
 
-      # do_build.sh muhtemelen kendi toolchain'ini indiriyor (AOSP Clang).
-      # Script'in kendi mantığını bozmamak için burada ayrıca toolchain
-      # indirmiyoruz — script'in PATH'i ne yapıyorsa onu izliyoruz.
-      - name: Apply UART/debug config fragment before build
+      # v5: SADECE işlevsel gereksinimler ekleniyor - UART/earlycon/pstore/
+      # loglevel/panic-timeout debug bloğu tamamen kaldırıldı.
+      - name: Apply required boot config (SELinux permissive + bpf spoof, no debug)
         working-directory: kernel
         run: |
           # Doğrulandı: gerçek defconfig fragmanı arch/arm64/configs/vendor/ginkgo.config
           # (ckbuild.sh: DEFAULT_DEFCONFIG=vendor/trinket-perf_defconfig,
           #  GINKGO_FRAGMENT=vendor/ginkgo.config üstüne merge ediliyor)
           DEFCONFIG_PATH="arch/arm64/configs/vendor/ginkgo.config"
-          echo "Debug config eklenecek dosya: $DEFCONFIG_PATH"
+          echo "İşlevsel config eklenecek dosya: $DEFCONFIG_PATH"
 
           cat >> "$DEFCONFIG_PATH" << 'EOF'
 
-          # ---- UART / early console debug (bring-up amaçlı, geçici) ----
-          CONFIG_SERIAL_MSM_GENI=y
-          CONFIG_SERIAL_MSM_GENI_CONSOLE=y
-          CONFIG_SERIAL_EARLYCON=y
-          CONFIG_SERIAL_CORE_CONSOLE=y
-          CONFIG_MSM_GENI_EARLY_CONSOLE=y
-          CONFIG_EARLY_PRINTK=y
-          CONFIG_CONSOLE_LOGLEVEL_DEFAULT=15
-          CONFIG_CONSOLE_LOGLEVEL_QUIET=15
-          CONFIG_MESSAGE_LOGLEVEL_DEFAULT=7
-          CONFIG_DEFAULT_MESSAGE_LOGLEVEL=7
-          CONFIG_PRINTK_TIME=y
-          CONFIG_PRINTK_PROCESS=y
-          CONFIG_DYNAMIC_DEBUG=y
-          CONFIG_LOG_BUF_SHIFT=21
-          CONFIG_PSTORE=y
-          CONFIG_PSTORE_CONSOLE=y
-          CONFIG_PSTORE_RAM=y
-          CONFIG_PSTORE_PMSG=y
-          CONFIG_PANIC_TIMEOUT=0
-          CONFIG_PANIC_ON_OOPS=n
-          CONFIG_DEBUG_KERNEL=y
-          CONFIG_MAGIC_SYSRQ=y
-          CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=n
-          CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=n
-
-          # ---- SELinux: varsayılan başlangıç durumu (yetersiz tek başına,
-          #      asıl zorlama aşağıdaki kaynak patch'inde - bkz. bir sonraki step) ----
+          # ---- SELinux: başlangıç durumu permissive (asıl zorlama kaynak
+          #      patch'inde - bkz. sonraki step) ----
           CONFIG_SECURITY_SELINUX_BOOTPARAM=y
           CONFIG_SECURITY_SELINUX_BOOTPARAM_VALUE=0
-          CONFIG_SECURITY_SELINUX_DEVELOP=y
 
-          # ---- v3: netbpfload/netd BPF kernel-sürüm kontrolünü geçmek ----
+          # ---- netbpfload/netd BPF kernel-sürüm kontrolünü geçmek ----
           # Base defconfig'de FAKE_UNAME_5_4 seçili, Android 16 "25Q4"
           # netbpfload build'i >=5.10 istiyor - 5.10'a yükseltiyoruz.
           # CONFIG_FAKE_UNAME_5_4 is not set
           CONFIG_FAKE_UNAME_5_10=y
 
-          # NOT (v4): "uname_bpf_spoof=2" burada hâlâ duruyor ama tek
-          # başına ETKİSİZ - CONFIG_CMDLINE_EXTEND=y ile bootloader'ın
-          # kendi "uname_bpf_spoof=1"i bu değerin ÜZERİNE yazıyor (sonuncu
-          # değer kazanıyor). Asıl fix aşağıdaki yeni source-patch adımında.
-          # Zararı yok, kaldırmaya gerek de yok.
-          CONFIG_CMDLINE="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive uname_bpf_spoof=2"
+          # ---- cmdline: debug flag'leri YOK. cgroup_disable=pressure geri
+          # eklendi (base defconfig'de vardı, v1-v4'te CONFIG_CMDLINE tam
+          # string override olduğu için sessizce kayboluyordu). Kernel
+          # kendi kararını (full bpf spoof mode) source patch ile zaten
+          # dayattığı için "uname_bpf_spoof=2" burada kozmetik/belgeleyici
+          # amaçlı bırakıldı, zararı yok.
+          CONFIG_CMDLINE="cgroup_disable=pressure androidboot.selinux=permissive uname_bpf_spoof=2"
           CONFIG_CMDLINE_EXTEND=y
           EOF
-          echo "Config eklendi, son 35 satır:"
-          tail -35 "$DEFCONFIG_PATH"
+          echo "Config eklendi, son 20 satır:"
+          tail -20 "$DEFCONFIG_PATH"
 
-      # ASIL FİX BURADA: init'in setenforce(1) çağrısını kernel seviyesinde
-      # etkisiz hale getiriyoruz. sel_write_enforce() /sys/fs/selinux/enforce
-      # yazma işleyicisidir; userspace'ten gelen değeri okuduktan hemen sonra
-      # 0'a sabitliyoruz, böylece init "enforcing'e geçtim" sanır ama
-      # selinux_enforcing hep 0 kalır. AVC denied'lar loglanmaya devam eder
-      # (audit_log çağrısı dokunulmadan kalıyor), sadece artık gerçek bir
-      # engelleme/EACCES üretmiyorlar.
+      # DEĞİŞMEDİ (v2'den beri): init'in setenforce(1) çağrısını kernel
+      # seviyesinde etkisiz hale getiriyoruz. sel_write_enforce()
+      # /sys/fs/selinux/enforce yazma işleyicisidir; userspace'ten gelen
+      # değeri okuduktan hemen sonra 0'a sabitliyoruz, böylece init
+      # "enforcing'e geçtim" sanır ama selinux_enforcing hep 0 kalır.
+      # AVC denied'lar loglanmaya devam eder (audit_log çağrısı dokunulmadan
+      # kalıyor), sadece artık gerçek bir engelleme/EACCES üretmiyorlar.
       - name: Patch sel_write_enforce() to ignore userspace enforcing requests
         working-directory: kernel
         run: |
@@ -201,12 +167,6 @@ jobs:
           echo "Fonksiyon $FUNC_START. satırda başlıyor, sonraki 40 satır:"
           sed -n "${FUNC_START},$((FUNC_START+40))p" "$SELINUXFS"
 
-          # Fonksiyon gövdesi içinde (başlangıçtan sonraki ~40 satırda) sscanf
-          # çağrısının bulunduğu satırı ara - bu satır userspace'ten gelen
-          # new_value'yu okur. Tam metin eşleşmesi yerine satır numarası +
-          # basit substring araması kullanıyoruz, whitespace/quoting'e karşı
-          # kırılgan olmasın diye (önceki python heredoc denemesi girinti
-          # yüzünden sessizce başarısız olmuştu).
           SSCANF_LINE=$(awk -v start="$FUNC_START" -v end="$((FUNC_START+60))" \
             'NR>=start && NR<=end && /sscanf/ {print NR; exit}' "$SELINUXFS")
           if [ -z "$SSCANF_LINE" ]; then
@@ -216,10 +176,6 @@ jobs:
           echo "sscanf çağrısı $SSCANF_LINE. satırda bulundu:"
           sed -n "${SSCANF_LINE}p" "$SELINUXFS"
 
-          # sscanf'ten sonraki ilk ";" ile biten satırı (genelde "goto out;")
-          # bul, patch'i onun HEMEN ALTINA ekle - böylece hem tek satırlık
-          # "if (sscanf(...) != 1) goto out;" hem de iki satıra bölünmüş
-          # hali için çalışır.
           INSERT_AFTER=$(awk -v s="$SSCANF_LINE" -v end="$((SSCANF_LINE+3))" \
             'NR>=s && NR<=end && /;/ {print NR; exit}' "$SELINUXFS")
           if [ -z "$INSERT_AFTER" ]; then
@@ -229,16 +185,6 @@ jobs:
           echo "Patch, ${INSERT_AFTER}. satırdan sonra eklenecek:"
           sed -n "${INSERT_AFTER}p" "$SELINUXFS"
 
-          # sed 'r <dosya>' ile ekleme: metni önce düz bir dosyaya yazıp
-          # (heredoc'un YAML'dan miras aldığı baştaki boşluklar C için
-          # zararsız - Python'daki gibi girintiye duyarlı değil), sonra
-          # sed'e sadece dosya adını veriyoruz. Hiçbir escape/quoting riski
-          # yok - önceki "a\" denemesinde yaşanan sorunun kökü buydu.
-          # Not: heredoc kasıtlı olarak kullanılmıyor - YAML blok metninin
-          # girinti kuralı ile bash heredoc'un "bitiş etiketi flush-left
-          # olmalı" kuralı çelişiyor (biri boşluk ister, diğeri boşluksuz).
-          # printf ile gerçek \n karakteri üretmek, girintiden tamamen
-          # bağımsız ve tek satırlık - hiçbir çelişki yok.
           printf '\n    /* FORCE PERMISSIVE PATCH: ignore whatever userspace (init) requests,\n     * always keep the kernel in permissive mode. AVC denials are still\n     * logged below via audit_log(), they just never become blocking. */\n    new_value = 0;\n' > /tmp/selinux_patch_snippet.txt
           sed -i "${INSERT_AFTER}r /tmp/selinux_patch_snippet.txt" "$SELINUXFS"
 
@@ -258,22 +204,14 @@ jobs:
           fi
           echo "OK: new_value = 0; satır $NEWVAL_LINE, sscanf satır $SSCANF_LINE'den sonra - sıralama doğru."
 
-      # v4 - ASIL FİX BURADA: cmdline'dan "uname_bpf_spoof=2" göndermek işe
-      # yaramıyor çünkü CONFIG_CMDLINE_EXTEND=y modunda bootloader'ın kendi
-      # "uname_bpf_spoof=1"i bizimkinin ÜZERİNE yazıyor (sonuncu kazanıyor).
-      # Bootloader/DTB tarafına dokunmadan çözmek için "partial mode"u
-      # tetikleyen "bpf_spoof == 1" karşılaştırmasını kaynakta öyle bir
-      # patch'liyoruz ki ASLA doğru olamasın (& 0 eklenerek) - bootloader
-      # ne cmdline değeri gönderirse göndersin, kod hep "full mode"a düşer
-      # (netd ve uprobestats de spoof kapsamına girer).
-      #
-      # Önce iki dosyada da ("kernel/sys.c" ve "init/main.c" - v3'te bu
-      # ikisinde bulunmuştu) "bpf_spoof" geçen HER satırı basıyoruz ki
-      # otomatik patch beklenenden farklı bir kalıp bulursa (ör. "!= 2"
-      # ya da bitmask kontrolü gibi) bunu Actions log'unda görüp bana
-      # yapıştırabilesin - körlemesine yanlış bir patch atıp build'i
-      # sessizce bozmuyoruz, sel_write_enforce patch'indeki gibi net bir
-      # hata ile duruyoruz.
+      # DEĞİŞMEDİ (v4'ten beri): cmdline'dan "uname_bpf_spoof=2" göndermek
+      # tek başına yeterli değil çünkü CONFIG_CMDLINE_EXTEND=y modunda
+      # bootloader'ın kendi "uname_bpf_spoof=1"i bizimkinin ÜZERİNE yazıyor
+      # (sonuncu kazanıyor). Bootloader/DTB tarafına dokunmadan çözmek için
+      # "partial mode"u tetikleyen "bpf_spoof == 1" karşılaştırmasını
+      # kaynakta öyle bir patch'liyoruz ki ASLA doğru olamasın (& 0
+      # eklenerek) - bootloader ne cmdline değeri gönderirse göndersin,
+      # kod hep "full mode"a düşer (netd ve uprobestats de spoof kapsamına girer).
       - name: Force uname_bpf_spoof full-mode regardless of cmdline value
         working-directory: kernel
         run: |
@@ -292,8 +230,6 @@ jobs:
               continue
             fi
 
-            # Değişken adı ne olursa olsun ("uname_bpf_spoof", "bpf_spoof" vs.)
-            # "bpf_spoof" içeren ve "== 1" ile karşılaştırma yapan satırı ara.
             LINE=$(grep -n "bpf_spoof" "$f" | grep -E '==[[:space:]]*1\b' | head -1 | cut -d: -f1)
             if [ -z "$LINE" ]; then
               continue
@@ -302,8 +238,6 @@ jobs:
             echo "=== $f satır $LINE (patch öncesi) ==="
             sed -n "$((LINE>3?LINE-3:1)),$((LINE+3))p" "$f"
 
-            # "bpf_spoof<opsiyonel_ek> == 1"  ->  aynı ifade + " && 0" ekleyip
-            # karşılaştırmayı hiçbir zaman doğru olamayacak hale getiriyoruz.
             sed -i -E "${LINE}s/([A-Za-z_]*bpf_spoof[A-Za-z_]*[[:space:]]*==[[:space:]]*1)\b/\\1 \&\& 0 \/* BPF_SPOOF_ALWAYS_FULL_PATCH *\//" "$f"
 
             echo "=== $f satır $LINE (patch sonrası) ==="
@@ -330,6 +264,13 @@ jobs:
           # device: ginkgo | laurel_sprout | all
           # options: k=KernelSU, s=SukiSU, x=XXKSU, c=clean, f=force tüm varyantlar
           # Vanilla (rootsuz) + temiz build için sade "ginkgo" veriyoruz.
+          #
+          # NOT: ckbuild.sh içinde "l" (küçük L) argümanı Full-LTO'ya
+          # geçiriyor (varsayılan zaten ThinLTO). Full-LTO teorik olarak
+          # birkaç % daha iyi kod üretebilir ama bu 4 çekirdekli Snapdragon
+          # 665 (Cortex-A73/A53) için build süresini çok uzatır ve gerçek
+          # dünyada ölçülebilir/garanti bir kazanç değildir - bu yüzden
+          # eklemedik. İstersen "ginkgo cl" ile deneyebilirsin.
           chmod +x do_build.sh
           ./do_build.sh ginkgo c 2>&1 | tee build.log
 
@@ -351,19 +292,15 @@ jobs:
 
       - name: Clone trinket-specific AnyKernel3 (fallback packaging)
         run: |
-          # Eğer ckbuild.sh zaten kendi flashable zip'ini ürettiyse bu adım
-          # sadece yedek; asıl zip found_artifacts.txt'te *anykernel*.zip
-          # olarak görünüyorsa onu kullanacağız.
           git clone --depth=1 "https://github.com/${{ github.event.inputs.anykernel_repo }}.git" AnyKernel3 || true
 
       - name: Package flashable zip
         run: |
           cd kernel
-          # 1) ckbuild.sh zaten bir flashable zip ürettiyse onu direkt kullan
           READY_ZIP=$(find . -iname "*anykernel*.zip" -o -iname "*ginkgo*.zip" 2>/dev/null | grep -v "^./AnyKernel3" | head -n1)
           if [ -n "$READY_ZIP" ]; then
             echo "Hazır zip bulundu: $READY_ZIP"
-            cp "$READY_ZIP" "../ginkgo-floppy-debug-kernel-$(date +%Y%m%d-%H%M).zip"
+            cp "$READY_ZIP" "../ginkgo-floppy-kernel-$(date +%Y%m%d-%H%M).zip"
           else
             echo "Hazır zip yok, Image'i manuel AnyKernel3'e paketliyoruz."
             IMG=$(find . -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" 2>/dev/null | head -n1)
@@ -372,12 +309,12 @@ jobs:
 
             if [ -f ../AnyKernel3/anykernel.sh ]; then
               if grep -q "^cmdline=" ../AnyKernel3/anykernel.sh; then
-                sed -i 's|^cmdline=.*|cmdline="console=ttyMSM0,115200n8 earlycon=qcom_geni,uart earlyprintk debug ignore_loglevel initcall_debug androidboot.selinux=permissive uname_bpf_spoof=2"|' ../AnyKernel3/anykernel.sh
+                sed -i 's|^cmdline=.*|cmdline="cgroup_disable=pressure androidboot.selinux=permissive uname_bpf_spoof=2"|' ../AnyKernel3/anykernel.sh
               fi
             fi
 
             cd ../AnyKernel3
-            zip -r9 "../ginkgo-floppy-debug-kernel-$(date +%Y%m%d-%H%M).zip" . -x ".git*"
+            zip -r9 "../ginkgo-floppy-kernel-$(date +%Y%m%d-%H%M).zip" . -x ".git*"
           fi
 
       - name: Upload build log (her zaman)
@@ -390,5 +327,5 @@ jobs:
       - name: Upload flashable kernel zip
         uses: actions/upload-artifact@v4
         with:
-          name: ginkgo-floppy-debug-kernel
-          path: ginkgo-floppy-debug-kernel-*.zip
+          name: ginkgo-floppy-kernel
+          path: ginkgo-floppy-kernel-*.zip
